@@ -2,35 +2,16 @@ import torch
 from torchvision.transforms import v2
 import os
 import orjson
-from evdev import ecodes as e
 from pathlib import Path
 from natsort import natsorted
 from torchcodec.decoders import VideoDecoder
 import timm
 from io import BytesIO
+from internal.device_manager import KEYS as keys
+from internal.device_manager import REL as rel
 
-BATCH = 7168 # 60fps 2mins batch (trimmed to be divisible by 128)
+BATCH = 3584 # 30fps 2mins batch (trimmed to be divisible by 128)
 
-
-
-keys = [e.KEY_W,
-e.KEY_A,
-e.KEY_S,
-e.KEY_D,
-e.KEY_F,
-e.KEY_G,
-e.KEY_Q,
-e.KEY_E,
-e.KEY_R,
-e.KEY_1,
-e.KEY_2,
-e.KEY_3,
-e.KEY_4,
-e.KEY_SPACE,
-e.BTN_LEFT,]
-
-rel = [e.REL_X,
-e.REL_Y,]
 
 def normalize_inputs(inputs):
     inputs = orjson.loads(inputs)
@@ -208,14 +189,11 @@ class JJSDatasetPrep():
                 del feature_chunks # for memory 2
                 all_features = all_features.cpu()
                 assert len(all_features) == BATCH, all_features.shape
-
-                # My data was in 60fps so I had to -
-                # do this when I switched to 30fps
-                mouse = all_mouse[frames_prcsd:end_frame]
+                
                 yield {
-                    "features": all_features[:BATCH:2],
-                    "keys":     all_keys[frames_prcsd:end_frame:2],
-                    "mouse":    mouse.view(-1, 2, 2).sum(dim=1),
+                    "features": all_features,
+                    "keys":     all_keys[frames_prcsd:end_frame],
+                    "mouse":    all_mouse[frames_prcsd:end_frame],
                 }
                 frames_prcsd += BATCH
 
@@ -223,9 +201,12 @@ class JJSDatasetPrep():
 
 inn = ["dataset"] # dataset folder(s) containing the video and the jsonl file
 out = "outputs_gen"
-Path(out).mkdir(parents=True, exist_ok=True)
+prepare_batch_size = 512 # decrease/increase based on your memory
+use_cuda = True
 
+
+Path(out).mkdir(parents=True, exist_ok=True)
 for file_inn in inn:
-    dts = JJSDatasetPrep(file_inn, out, 7168, use_cuda=True)
+    dts = JJSDatasetPrep(file_inn, out, prepare_batch_size, use_cuda=use_cuda)
     for out_batch in dts:
         torch.save(out_batch, f"{out}/{dts.current_outstem}.pt")

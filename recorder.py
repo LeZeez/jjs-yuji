@@ -8,21 +8,15 @@ from pathlib import Path
 import time
 import json
 from dataclasses import dataclass
+import internal.config as c
 
-NEAREST_STOP = 3584 # stop when frames are divisible by 
-                    # this number (1min and divisible by 128 in my case)
-
-FPFX = "recs/rec" # any folder then the prefix of each recorded
-                  # video is added automatically (e.g., recs/rec_1, recs/recs_2)
-FPS = 60
-CAM_IDX = 2 # OBS for me
-WIDTH = 1280
-HEIGHT = 720
+cfg = c.Config.load()
 
 
-# you can override index for each using `ovrd_idx` instead of asking everytime
-mouse = dm.find_mouse()
-keyboard = dm.find_keyboard()
+# devices are picked in the GUI (same list since it uses the same strict setting)
+mouse = dm.find_mouse(cfg.strict_devices)[cfg.mouse_idx or 0]
+keyboard = dm.find_keyboard(cfg.strict_devices)[cfg.keyboard_idx or 0]
+print(f"Mouse: {mouse.name} | Keyboard: {keyboard.name}")
 
 
 @dataclass
@@ -33,13 +27,14 @@ checker = Checker()
 
 def done_true():
     checker.is_done = True
+    notification.notify(title="Got signal. Wait!", timeout=1)
 
-# ctrl + alt + x to stop check and then stop recording when frames recorded % NEAREST_STOP == 0 
+# ctrl + alt + x to stop check and then stop recording when frames recorded % cfg.nearest_stop == 0
 listener =  kb.GlobalHotKeys({'<ctrl>+<alt>+x': done_true})
 listener.start()
 
 
-out_pth = Path("/".join(FPFX.split("/")[:-1]))
+out_pth = Path("/".join(cfg.out_prefix.split("/")[:-1]))
 out_pth.mkdir(parents=True, exist_ok=True)
 frames_recorded = 0
 
@@ -56,17 +51,17 @@ cv2.setNumThreads(1)
 
 ##########################
 fc = dm.FrameRecorder()
-recorder = cm.DataRecorder(CAM_IDX, WIDTH, HEIGHT, FPS, f"{FPFX}_{count}.mkv")
+recorder = cm.DataRecorder(cfg.cam_idx, cfg.width, cfg.height, cfg.fps, f"{cfg.out_prefix}_{count}.mkv")
 notification.notify(title="Get ready. Recording in 5 seconds.", timeout=1)
 time.sleep(5)
 notification.notify(title="Recording...", timeout=1)
-with recorder.open_file(), open(f"{FPFX}_{count}.jsonl", 'w') as f:
+with recorder.open_file(), open(f"{cfg.out_prefix}_{count}.jsonl", 'w') as f:
     while True:
         recorder.write()
         frame_data = fc.get_frame_controls(mouse=mouse, keyboard=keyboard)
         f.write(json.dumps(frame_data) + "\n")
         frames_recorded += 1
-        if checker.is_done and frames_recorded % NEAREST_STOP == 0:
+        if checker.is_done and frames_recorded % cfg.nearest_stop == 0:
             break
 notification.notify(title="Done!", timeout=1)
 recorder.release()

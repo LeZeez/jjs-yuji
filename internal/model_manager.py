@@ -1,7 +1,11 @@
 from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
 import torch
 import torch.nn as nn
+from internal.config import Config
 from math import floor
+from torchvision.transforms import v2
+import timm
+import cv2
 from typing import Literal, List
 
 ModelMode = Literal["inference", "train"]
@@ -60,3 +64,43 @@ class JJSYuji(nn.Module):
         mouse_preds = self.mouse_layer(normed)
 
         return key_preds, mouse_preds, new_states
+
+
+class Vision(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.vision = timm.create_model(
+            'vit_small_patch16_dinov3.lvd1689m',
+            pretrained=True,
+            features_only=True,
+            out_indices=(-1,)
+        )
+
+        data_config = timm.data.resolve_model_data_config(self.vision)
+        self.transform = v2.Compose([
+        v2.ToImage(),
+        v2.Resize((cfg.vsn_height, cfg.vsn_width), antialias=True),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=data_config["mean"], std=data_config["std"])
+        ])
+
+    def forward(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = self.transform(frame).unsqueeze(0).cuda()
+        frame = self.vision(frame)[0].unsqueeze(0)
+
+        return frame
+
+    
+def load_model(cfg: Config, *args, **kwargs):
+    ckpt = torch.load(cfg.ckpt_path)
+    vision = Vision(cfg)
+    model = JJSYuji(*args, **kwargs,
+                    num_keys=cfg.num_keys,
+                    num_bins_x=cfg.num_bins_x,
+                    num_bins_y=cfg.num_bins_y)
+    model.register_buffer("x_bins", torch.zeros(cfg.num_bins_x))
+    model.register_buffer("y_bins", torch.zeros(cfg.num_bins_y))
+    model.register_buffer("key_thresh", torch.zeros(cfg.num_keys))
+    model.load_state_dict(ckpt)
+    return model, vision

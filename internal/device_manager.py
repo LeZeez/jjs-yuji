@@ -1,124 +1,60 @@
-import attr
 import numpy as np
 import evdev
 from evdev import InputDevice, UInput, ecodes as e
 
 # FINDING DEVICES
 
-def find_keyboard(ovrd_idx: int = None):
+ALPHABET_KEYS = {getattr(e, f"KEY_{c}") for c in "ABCDEFGHIJKLMNOPQRSTUVWXY" + "Z"}
+CORE_KEYS = ALPHABET_KEYS | {e.KEY_SPACE, e.KEY_ENTER}
+
+def find_keyboard(strict=True):
     devices = [InputDevice(path) for path in evdev.list_devices()]
     kybrds = []
     for dev in devices:
-        # check if the device has Z key hehe
-        capabilities = dev.capabilities()
-        if e.EV_KEY in capabilities and e.KEY_Z in capabilities[e.EV_KEY]:
+        # check key capabilities
+        caps = dev.capabilities()
+
+        keys = set(caps.get(e.EV_KEY, []))
+        has_core = CORE_KEYS.issubset(keys)
+        if strict == True:
+            has_rel = e.EV_REL in caps and e.REL_X in caps[e.EV_REL] # check if it has any REL caps
+            has_abs_axes = e.EV_ABS in caps
+            if has_rel or has_abs_axes: 
+                continue # skip the device
+            if any(term in dev.name.lower() for term in ("mouse",)):
+                continue
+
+        if has_core: # check if it has alphabet
             kybrds.append(dev)
-    
-    if not kybrds:
-        return None
-    if len(kybrds) == 1:
-        return kybrds[0]
-    if ovrd_idx is not None:
-        print(f"Using index {ovrd_idx}: {kybrds[ovrd_idx].name}")
-        return kybrds[ovrd_idx]
 
-    # nice message
-    names = "\n".join(  [f"{kybrd.name}: {ix}" for ix, kybrd in enumerate(kybrds)]  )
-    message = (f"We found {len(kybrds)} keyboards:\n"
-               f"{names}\n"
-               "Choose one: ")
-    
-    kybrds_idx = int(input(message))
-    return kybrds[kybrds_idx]
+    return kybrds
 
-def find_mouse(ovrd_idx: int = None):
+
+def find_mouse(strict=True):
     devices = [InputDevice(path) for path in evdev.list_devices()]
     mice = []
     for dev in devices:
         # check if the device has relative displacement
-        capabilities = dev.capabilities()
-        if e.EV_REL in capabilities and e.REL_X in capabilities[e.EV_REL]:
-            mice.append(dev)
-    
-    if not mice:
-        return None
-    if len(mice) == 1:
-        return mice[0]
-    if ovrd_idx is not None:
-        print(f"Using index {ovrd_idx}: {mice[ovrd_idx].name}")
-        return mice[ovrd_idx]
+        caps = dev.capabilities()
 
-    # mice message
-    names = "\n".join(  [f"{mouse.name}: {idx}" for idx, mouse in enumerate(mice)]  )
-    message = (f"We found {len(mice)} mouse devices:\n"
-               f"{names}\n"
-               "Choose one: ")
-    
-    mouse_idx = int(input(message))
-    return mice[mouse_idx]
+        if strict == True:
+            keys = set(caps.get(e.EV_KEY, []))
+            has_core = CORE_KEYS.issubset(keys) # check if it has any keyboard keys
+            if has_core: 
+                continue # skip the device
+            if any(term in dev.name.lower() for term in ("kbd", "keyboard")):
+                continue
+
+
+        has_rel = e.EV_REL in caps and e.REL_X in caps[e.EV_REL] # check if it has any REL caps
+        if has_rel:
+            mice.append(dev)
+
+    return mice
 
 # RECORDING / READING
 
-class QuantizationScheme:
-    LINEAR = "linear"
-    MU_LAW = "mu_law"
-
-@attr.s(auto_attribs=True)
-class CameraQuantizer:
-    """
-    A camera quantizer that discretizes and undiscretizes a continuous camera input with y (pitch) and x (yaw) components.
-
-    Parameters:
-    - camera_binsize: The size of the bins used for quantization. In case of mu-law quantization, it corresponds to the average binsize.
-    - camera_maxval: The maximum value of the camera action.
-    - quantization_scheme: The quantization scheme to use. Currently, two quantization schemes are supported:
-    - Linear quantization (default): Camera actions are split uniformly into discrete bins
-    - Mu-law quantization: Transforms the camera action using mu-law encoding (https://en.wikipedia.org/wiki/%CE%9C-law_algorithm)
-    followed by the same quantization scheme used by the linear scheme.
-    - mu: Mu is the parameter that defines the curvature of the mu-law encoding. Higher values of
-    mu will result in a sharper transition near zero. Below are some reference values listed
-    for choosing mu given a constant maxval and a desired max_precision value.
-    maxval = 10 | max_precision = 0.5  | μ ≈ 2.93826
-    maxval = 10 | max_precision = 0.4  | μ ≈ 4.80939
-    maxval = 10 | max_precision = 0.25 | μ ≈ 11.4887
-    maxval = 20 | max_precision = 0.5  | μ ≈ 2.7
-    maxval = 20 | max_precision = 0.4  | μ ≈ 4.39768
-    maxval = 20 | max_precision = 0.25 | μ ≈ 10.3194
-    maxval = 40 | max_precision = 0.5  | μ ≈ 2.60780
-    maxval = 40 | max_precision = 0.4  | μ ≈ 4.21554
-    maxval = 40 | max_precision = 0.25 | μ ≈ 9.81152
-    """
-
-    camera_maxval: int
-    camera_binsize: int
-    quantization_scheme: str = attr.ib(
-        default=QuantizationScheme.LINEAR,
-        validator=attr.validators.in_([QuantizationScheme.LINEAR, QuantizationScheme.MU_LAW]),
-    )
-    mu: float = attr.ib(default=5)
-
-    def discretize(self, xy):
-        xy = np.clip(xy, -self.camera_maxval, self.camera_maxval)
-
-        if self.quantization_scheme == QuantizationScheme.MU_LAW:
-            xy = xy / self.camera_maxval
-            v_encode = np.sign(xy) * (np.log(1.0 + self.mu * np.abs(xy)) / np.log(1.0 + self.mu))
-            v_encode *= self.camera_maxval
-            xy = v_encode
-
-        # Quantize using linear scheme
-        return np.round((xy + self.camera_maxval) / self.camera_binsize).astype(np.int64)
-
-    def undiscretize(self, xy):
-        xy = xy * self.camera_binsize - self.camera_maxval
-
-        if self.quantization_scheme == QuantizationScheme.MU_LAW:
-            xy = xy / self.camera_maxval
-            v_decode = np.sign(xy) * (1.0 / self.mu) * ((1.0 + self.mu) ** np.abs(xy) - 1.0)
-            v_decode *= self.camera_maxval
-            xy = v_decode
-        return xy
-
+# unusued for now
 def soft_decode(logits, quantizer, num_bins):
     exp = np.exp(logits - logits.max())
     probs = exp / exp.sum()
@@ -175,29 +111,36 @@ class FrameRecorder:
 
 # EXECUTION
 
+# all mouse and keyboard keys + mouse deltas
 CAPABILITIES = {
     e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
     e.EV_KEY: list(e.keys.keys()) + list(e.BTN.keys())
 }
 
-KEYS = [e.KEY_W,
-e.KEY_A,
-e.KEY_S,
-e.KEY_D,
-e.KEY_F,
-e.KEY_G,
-e.KEY_Q,
-e.KEY_E,
-e.KEY_R,
-e.KEY_1,
-e.KEY_2,
-e.KEY_3,
-e.KEY_4,
-e.KEY_SPACE,
-e.BTN_LEFT,]
+# all keyboard keys, in order
+KEYS = [
+    e.KEY_W,
+    e.KEY_A,
+    e.KEY_S,
+    e.KEY_D,
+    e.KEY_F,
+    e.KEY_G,
+    e.KEY_Q,
+    e.KEY_E,
+    e.KEY_R,
+    e.KEY_1,
+    e.KEY_2,
+    e.KEY_3,
+    e.KEY_4,
+    e.KEY_SPACE,
+    e.BTN_LEFT,
+]
 
-REL = [e.REL_X,
-e.REL_Y,]
+# mouse deltas
+REL = [
+    e.REL_X,
+    e.REL_Y,
+]
 
 def init_input_device(name: str):
     return UInput(CAPABILITIES, name=name)

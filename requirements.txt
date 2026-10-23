@@ -12,3 +12,5 @@ pynput==1.8.2
 plyer==2.1.0
 orjson==3.12.0
 natsort==8.4.0
+customtkinter==6.0.0
+cv2_enumerate_cameras==1.4.0
