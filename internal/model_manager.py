@@ -1,15 +1,22 @@
-from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
+
+import cv2
+import timm
+import queue
+import threading
 import torch
 import torch.nn as nn
-from internal.config import Config
+import torch.nn.functional as F
+from torch.types import Device
 from math import floor
-from torchvision.transforms import v2
-import timm
-import cv2
+from numpy.typing import NDArray
 from typing import Literal, List
+from internal.config import Config
+from torchvision.transforms import v2
+from internal.device_manager import KEYS, REL
+from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
 
 ModelMode = Literal["inference", "train"]
-StateType = List[mLSTMLayerStateType]
+StateType = List[mLSTMLayerStateType] | None
 
 
 class JJSYuji(nn.Module):
@@ -63,7 +70,7 @@ class JJSYuji(nn.Module):
         key_preds = self.key_layer(normed)
         mouse_preds = self.mouse_layer(normed)
 
-        return key_preds, mouse_preds, new_states
+        return (key_preds, mouse_preds), new_states
 
 
 class Vision(nn.Module):
@@ -85,11 +92,37 @@ class Vision(nn.Module):
         ])
 
     def forward(self, frame):
+        device = next(self.vision.parameters()).device  # cuda but kept like that for flexibility for later (e.g. cpu mode)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = self.transform(frame).unsqueeze(0).cuda()
+        frame = self.transform(frame).unsqueeze(0).to(device)
         frame = self.vision(frame)[0].unsqueeze(0)
 
         return frame
+
+@torch.no_grad()
+def get_controls(model_out, cfg, model):
+    
+    key_preds_raw, mouse_preds = model_out
+    mem_keys = F.sigmoid(key_preds_raw)
+    mem_keys = mem_keys > (model.key_thresh - cfg.kbrd_thresh_soften)
+    mem_keys = mem_keys.long().tolist()[0][0]
+
+    mouse_preds = mouse_preds.reshape([cfg.num_bins_x + cfg.num_bins_y])
+    preds_x = mouse_preds[..., :cfg.num_bins_x] / cfg.mouse_temp
+    preds_y = mouse_preds[..., cfg.num_bins_x:] / cfg.mouse_temp
+
+    preds_x = preds_x.argmax(-1)
+    preds_y = preds_y.argmax(-1)
+
+    preds_x = model.x_bins[preds_x]
+    preds_y = model.y_bins[preds_y]
+
+
+    key_dct = {k: v for k, v in zip(KEYS, mem_keys)}
+
+    exec_mouse = [preds_x.item(), preds_y.item()]
+    mouse_dct = {k: v for k, v in zip(REL, exec_mouse)}
+    return {"keys": key_dct, "mouse": mouse_dct}
 
     
 def load_model(cfg: Config, *args, **kwargs):
@@ -104,3 +137,69 @@ def load_model(cfg: Config, *args, **kwargs):
     model.register_buffer("key_thresh", torch.zeros(cfg.num_keys))
     model.load_state_dict(ckpt)
     return model, vision
+
+
+class ThreadModel:
+    def __init__(self, cfg: Config,  device: Device):
+        self.request_queue = queue.Queue()
+        self.device = device
+
+        self.thread = threading.Thread(
+            target=self._load,
+            args=(cfg, device),
+            daemon=True
+        )
+
+        self.thread.start() # forgot to add this and wondered why it didn't work (cost: 5 minutes)
+
+
+    def _load(self, cfg: Config, device: Device):
+
+        try:
+            # hardcoding eval/inference cuz not ideal for training anyway
+            model, vision = load_model(cfg, mode="inference")
+            model = model.to(device).eval()
+            vision = vision.to(device).eval()
+            load_error = None
+        except Exception as e:
+            load_error = e # e.g. wrong ckpt_path, sent back on every request instead of hanging
+
+        while True:
+            item = self.request_queue.get()
+            if item is None:  # shutdown cleanly
+                self.request_queue.task_done()
+                break
+
+            frame, states, result_queue = item
+            try:
+                if load_error is not None:
+                    raise load_error
+
+                with torch.no_grad():
+
+                    vision_out = vision(frame) # convert frame to DINO features
+                    model_out, states = model(vision_out, states)
+
+                controls = get_controls(model_out, cfg, model)
+                    
+                result_queue.put((controls, states, True, None))
+            except Exception as e:
+                result_queue.put((None, None, False, e))
+            finally:
+                self.request_queue.task_done()
+
+    def generate(self, frame: NDArray, states: StateType = None):
+        result_queue = queue.Queue()
+        self.request_queue.put((frame, states, result_queue))
+        controls, states, success, excep = result_queue.get()
+
+        if success == False:
+            raise excep
+
+        result_queue.task_done()
+        return controls, states
+
+    def stop(self):
+        self.request_queue.put(None)
+        self.thread.join()
+        

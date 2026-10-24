@@ -19,8 +19,7 @@ NUM_BINS_X = 25
 NUM_BINS_Y = 15
 MU = 3
 NUM_KEYS = 15
-BATCH  = 7168
-HALF_BATCH = BATCH // 2
+BATCH  = 3584
 LR = 1e-4
 T_MAX = 4000
 PROPSPTH = "outputs_gen_props.pt" # calculates dataset props once so you don't have to redo it again
@@ -189,15 +188,15 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(
 
 
 bs = 4 # split individual videos into separate batches to introduce noise
-seq_len = (HALF_BATCH) // bs
+seq_len = BATCH // bs
 
 mouse_size = [bs * seq_len, NUM_BINS_X + NUM_BINS_Y]
 key_size = [bs, seq_len, NUM_KEYS]
 features_size = [bs, seq_len, 384, 15, 27]
 
-assert 0 <= SHIFTAMOUNT < HALF_BATCH
+assert 0 <= SHIFTAMOUNT < BATCH
 
-loss_mask = torch.ones(HALF_BATCH, dtype=torch.bool, device="cuda")
+loss_mask = torch.ones(BATCH, dtype=torch.bool, device="cuda")
 if SHIFTAMOUNT > 0:
     loss_mask[-SHIFTAMOUNT:] = False
 
@@ -208,17 +207,17 @@ loss_mask_mouse = loss_mask.clone()
 for i, batch in enumerate(dataloader):
     features, scale, target_keys, target_mouse = batch
     # discard extra feats if exist
-    if min(len(features), len(target_keys), len(target_mouse)) < HALF_BATCH:
+    if min(len(features), len(target_keys), len(target_mouse)) < BATCH:
         print(
             f"Too short: features={len(features)}, "
             f"keys={len(target_keys)}, mouse={len(target_mouse)}"
         )
         continue
 
-    features = features[:HALF_BATCH].cuda()
+    features = features[:BATCH].cuda()
     scale = scale.cuda().view(1, 384, 1, 1)
-    target_keys = target_keys[:HALF_BATCH]
-    target_mouse = target_mouse[:HALF_BATCH]
+    target_keys = target_keys[:BATCH]
+    target_mouse = target_mouse[:BATCH]
 
     # apply shift
     if SHIFTAMOUNT > 0:
@@ -240,7 +239,7 @@ for i, batch in enumerate(dataloader):
 
     # calc loss
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        key_preds, mouse_preds, _ = model(features)
+        (key_preds, mouse_preds), _ = model(features)
         key_preds = key_preds.view(key_size)
 
         loss_keys = key_loss_fn(key_preds[loss_mask_key], target_keys[loss_mask_key])

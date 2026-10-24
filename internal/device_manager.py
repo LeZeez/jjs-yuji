@@ -1,6 +1,14 @@
 import numpy as np
 import evdev
 from evdev import InputDevice, UInput, ecodes as e
+from plyer import notification
+
+def notfy(message):
+    notification.notify(title=message, timeout=1)
+
+def stop_notfy(event, on_status):
+    event.set()
+    on_status("Stopping...")
 
 # FINDING DEVICES
 

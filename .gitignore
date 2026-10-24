@@ -4,3 +4,4 @@
 model.pt
 output_model.pt
 config.json
+.vscode/
