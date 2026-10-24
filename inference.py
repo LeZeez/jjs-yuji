@@ -1,4 +1,3 @@
-import torch
 import threading
 import numpy as np
 from pynput import keyboard as kb
@@ -9,10 +8,12 @@ import internal.config as c
 
 
 def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status = dm.notfy):
-    cam = DataRecorder(cfg.cam_idx, cfg.width, cfg.height, cfg.fps, "_")
+    cap = cfg.play
+    cam = DataRecorder(cap.cam_idx, cap.width, cap.height, cap.fps, "_")
     try:
         for _ in range(5):
-            model.generate(np.random.randint(0, 255, [cfg.vsn_height, cfg.vsn_width, 3], dtype=np.uint8)) #warmup
+            warmup = np.random.randint(0, 255, [cap.height, cap.width, 3], dtype=np.uint8)
+            model.generate(warmup, None, cfg.play)
 
         on_status("Get ready. Playing in 3 seconds.")
         if event.wait(3):
@@ -21,10 +22,10 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
 
         # == INFERENCE ==
         states = None
-        with dm.init_input_device("TEST") as ui, torch.no_grad():
+        with dm.init_input_device("TEST") as ui:
             while not event.is_set():
                 frame = cam.read()
-                frame_data, states = model.generate(frame, states)
+                frame_data, states = model.generate(frame, states, cfg.play)
                 dm.execute_frames(ui, frame_data, 1, 1)
                 ui.syn()
     finally:
@@ -38,5 +39,5 @@ if __name__ == "__main__":
         {'<ctrl>+<alt>+x': lambda: dm.stop_notfy(event, dm.notfy)})
     listener.start()
     config = c.Config.load()
-    model = mm.ThreadModel(config, "cuda")
+    model = mm.ThreadModel(config.model, "cuda")
     play(config, model, event, dm.notfy)

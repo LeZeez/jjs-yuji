@@ -11,21 +11,24 @@ class DataRecorder:
         self.cam = cv2.VideoCapture(device_idx)
         if device_fourcc:
             self.cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*device_fourcc))
-        self.cam.set(3, width)
-        self.cam.set(4, height)
-        self.cam.set(5, fps)
+        # only a request, the driver picks the closest mode it supports (OBS virtual cam is fixed by OBS's output size tho)
+        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cam.set(cv2.CAP_PROP_FPS, fps)
 
+        # set() can return True even if it got ignored, so the first frame is the real answer
         success, sample_frame = self.cam.read()
         if not success or sample_frame is None:
             raise RuntimeError(f"Camera {device_idx} failed to return a frame at startup.")
         real_h, real_w = sample_frame.shape[:2]
         if real_w != width or real_h != height:
-            print("Camera rejected requested resolution! Using actual camera output for writer.")
+            print(f"Camera rejected requested resolution! Using actual camera output for writer ({real_w}x{real_h}).")
+            
 
         self.encoder = Encoder()
         self.video_stream = self.encoder.add_video(
-            height=height,
-            width=width,
+            height=real_h,
+            width=real_w,
             frame_rate=fps,
             codec="libx264",
             preset="veryfast",

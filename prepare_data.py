@@ -158,14 +158,10 @@ class JJSDatasetPrep():
 
             # spaghetti
             frames_prcsd = 0
-            while frames_prcsd < total_frames or not(frames_prcsd + BATCH >= total_frames):
-                end_frame = min(frames_prcsd + BATCH, total_frames)
+            while frames_prcsd + BATCH <= total_frames:
+                end_frame = frames_prcsd + BATCH
                 self.current_outstem = self.current_stem if total_frames <= BATCH else \
                       self.current_stem + f"_{frames_prcsd}-{end_frame}"
-                
-                if end_frame - frames_prcsd < BATCH:
-                    print(f"Skipping {self.current_outstem}, end of file shorter than {BATCH}...")
-                    break
 
                 if self.current_outstem in self.out_names:
                     print(f"Skipping {self.current_outstem}, already processed...")
@@ -196,6 +192,9 @@ class JJSDatasetPrep():
                     "mouse":    all_mouse[frames_prcsd:end_frame],
                 }
                 frames_prcsd += BATCH
+
+            if frames_prcsd < total_frames:
+                print(f"Skipped the last {total_frames - frames_prcsd} frames of {self.current_stem}, shorter than {BATCH}...")
 
 
 

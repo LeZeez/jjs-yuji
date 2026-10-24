@@ -1,5 +1,6 @@
 
 import cv2
+import copy
 import timm
 import queue
 import threading
@@ -10,7 +11,7 @@ from torch.types import Device
 from math import floor
 from numpy.typing import NDArray
 from typing import Literal, List
-from internal.config import Config
+from internal.config import ModelConfig, PlayConfig
 from torchvision.transforms import v2
 from internal.device_manager import KEYS, REL
 from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
@@ -21,13 +22,17 @@ StateType = List[mLSTMLayerStateType] | None
 
 class JJSYuji(nn.Module):
     def __init__(self, num_keys: int, num_bins_x: int,
-                 num_bins_y: int,  mode: ModelMode = "train"):
+                 num_bins_y: int, vsn_width: int = 432, vsn_height: int = 240,
+                 mode: ModelMode = "train"):
         super().__init__()
+        self.num_bins_x = num_bins_x
+        self.num_bins_y = num_bins_y
         self.conv = nn.Conv2d(384, 64, 1)
         self.dropout2d = nn.Dropout2d(p=0.2)
         self.convstr = nn.Conv2d(64, 64, 3, 2, 1)
-        h = floor((15 + 2*1 - 3) / 2) + 1
-        w = floor((27 + 2*1 - 3) / 2) + 1
+        # DINO's feature map is vsn size / 16 (patch size), e.g. 240x432 -> 15x27
+        h = floor((vsn_height // 16 + 2*1 - 3) / 2) + 1
+        w = floor((vsn_width // 16 + 2*1 - 3) / 2) + 1
         self.img_dim = self.convstr.out_channels * h * w
         self.down_proj = nn.Linear(self.img_dim, 1024)
         self.gelu = nn.GELU()
@@ -74,7 +79,7 @@ class JJSYuji(nn.Module):
 
 
 class Vision(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, vsn_width: int, vsn_height: int):
         super().__init__()
         self.vision = timm.create_model(
             'vit_small_patch16_dinov3.lvd1689m',
@@ -86,7 +91,7 @@ class Vision(nn.Module):
         data_config = timm.data.resolve_model_data_config(self.vision)
         self.transform = v2.Compose([
         v2.ToImage(),
-        v2.Resize((cfg.vsn_height, cfg.vsn_width), antialias=True),
+        v2.Resize((vsn_height, vsn_width), antialias=True),
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(mean=data_config["mean"], std=data_config["std"])
         ])
@@ -100,16 +105,16 @@ class Vision(nn.Module):
         return frame
 
 @torch.no_grad()
-def get_controls(model_out, cfg, model):
-    
+def get_controls(model_out, play_cfg: PlayConfig, model: JJSYuji):
+
     key_preds_raw, mouse_preds = model_out
     mem_keys = F.sigmoid(key_preds_raw)
-    mem_keys = mem_keys > (model.key_thresh - cfg.kbrd_thresh_soften)
+    mem_keys = mem_keys > (model.key_thresh - play_cfg.kbrd_thresh_soften)
     mem_keys = mem_keys.long().tolist()[0][0]
 
-    mouse_preds = mouse_preds.reshape([cfg.num_bins_x + cfg.num_bins_y])
-    preds_x = mouse_preds[..., :cfg.num_bins_x] / cfg.mouse_temp
-    preds_y = mouse_preds[..., cfg.num_bins_x:] / cfg.mouse_temp
+    mouse_preds = mouse_preds.reshape([model.num_bins_x + model.num_bins_y])
+    preds_x = mouse_preds[..., :model.num_bins_x] / play_cfg.mouse_temp
+    preds_y = mouse_preds[..., model.num_bins_x:] / play_cfg.mouse_temp
 
     preds_x = preds_x.argmax(-1)
     preds_y = preds_y.argmax(-1)
@@ -125,44 +130,63 @@ def get_controls(model_out, cfg, model):
     return {"keys": key_dct, "mouse": mouse_dct}
 
     
-def load_model(cfg: Config, *args, **kwargs):
-    ckpt = torch.load(cfg.ckpt_path)
-    vision = Vision(cfg)
-    model = JJSYuji(*args, **kwargs,
-                    num_keys=cfg.num_keys,
-                    num_bins_x=cfg.num_bins_x,
-                    num_bins_y=cfg.num_bins_y)
-    model.register_buffer("x_bins", torch.zeros(cfg.num_bins_x))
-    model.register_buffer("y_bins", torch.zeros(cfg.num_bins_y))
-    model.register_buffer("key_thresh", torch.zeros(cfg.num_keys))
-    model.load_state_dict(ckpt)
-    return model, vision
+def read_checkpoint(path):
+    # returns the weights and the sizes the model was trained with
+    ckpt = torch.load(path)
+    if "state_dict" in ckpt:
+        return ckpt["state_dict"], ckpt["config"]
+
+    # old format (plain state_dict): sizes come from the weight shapes.
+    # the vision size can't be recovered from them, so it's the one the original model used
+    return ckpt, {
+        "num_keys": ckpt["key_layer.weight"].shape[0],
+        "num_bins_x": ckpt["x_bins"].shape[0],
+        "num_bins_y": ckpt["y_bins"].shape[0],
+        "vsn_width": 432,
+        "vsn_height": 240,
+    }
+
+
+def load_model(path, mode: ModelMode = "train"):
+    state_dict, sizes = read_checkpoint(path)
+    vision = Vision(sizes["vsn_width"], sizes["vsn_height"])
+    model = JJSYuji(**sizes, mode=mode)
+    model.register_buffer("x_bins", torch.zeros(sizes["num_bins_x"]))
+    model.register_buffer("y_bins", torch.zeros(sizes["num_bins_y"]))
+    model.register_buffer("key_thresh", torch.zeros(sizes["num_keys"]))
+    model.load_state_dict(state_dict)
+    return model, vision, sizes
 
 
 class ThreadModel:
-    def __init__(self, cfg: Config,  device: Device):
+    def __init__(self, cfg: ModelConfig,  device: Device):
         self.request_queue = queue.Queue()
         self.device = device
+        self.cfg = copy.copy(cfg) # what it was loaded with, the GUI compares it to know if a reload is needed
+        self.ready = threading.Event() # set when loading ends (even if it failed)
+        self.load_error = None
+        self.sizes = None # read from the checkpoint once loaded
 
         self.thread = threading.Thread(
             target=self._load,
-            args=(cfg, device),
+            args=(self.cfg, device),
             daemon=True
         )
 
         self.thread.start() # forgot to add this and wondered why it didn't work (cost: 5 minutes)
 
 
-    def _load(self, cfg: Config, device: Device):
+    def _load(self, cfg: ModelConfig, device: Device):
 
         try:
             # hardcoding eval/inference cuz not ideal for training anyway
-            model, vision = load_model(cfg, mode="inference")
+            model, vision, self.sizes = load_model(cfg.ckpt_path, mode="inference")
             model = model.to(device).eval()
             vision = vision.to(device).eval()
-            load_error = None
         except Exception as e:
-            load_error = e # e.g. wrong ckpt_path, sent back on every request instead of hanging
+            self.load_error = e # e.g. wrong ckpt_path, sent back on every request instead of hanging
+        finally:
+            self.ready.set()
 
         while True:
             item = self.request_queue.get()
@@ -170,27 +194,27 @@ class ThreadModel:
                 self.request_queue.task_done()
                 break
 
-            frame, states, result_queue = item
+            frame, states, play_cfg, result_queue = item
             try:
-                if load_error is not None:
-                    raise load_error
+                if self.load_error is not None:
+                    raise self.load_error
 
+                # forward pass
                 with torch.no_grad():
-
-                    vision_out = vision(frame) # convert frame to DINO features
+                    vision_out = vision(frame)
                     model_out, states = model(vision_out, states)
 
-                controls = get_controls(model_out, cfg, model)
-                    
+                controls = get_controls(model_out, play_cfg, model)
                 result_queue.put((controls, states, True, None))
             except Exception as e:
                 result_queue.put((None, None, False, e))
             finally:
                 self.request_queue.task_done()
 
-    def generate(self, frame: NDArray, states: StateType = None):
+    # play_cfg is sent with every frame so mouse temp / key eagerness apply without a reload
+    def generate(self, frame: NDArray, states: StateType, play_cfg: PlayConfig):
         result_queue = queue.Queue()
-        self.request_queue.put((frame, states, result_queue))
+        self.request_queue.put((frame, states, play_cfg, result_queue))
         controls, states, success, excep = result_queue.get()
 
         if success == False:

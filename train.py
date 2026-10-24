@@ -15,19 +15,23 @@ import internal.mu as mu
 SAVE_PATH = "output_model.pt"
 
 SHIFTAMOUNT = 2
+NUM_KEYS = 15
 NUM_BINS_X = 25
 NUM_BINS_Y = 15
-MU = 3
-NUM_KEYS = 15
+MU = 3 # use carefully
+VSN_WIDTH = 432 # must match the resize in prepare_data.py
+VSN_HEIGHT = 240 # ^^^
 BATCH  = 3584
+BATCH_SPLITS = 4 # splitting a video to n independent sequences for noise
 LR = 1e-4
 T_MAX = 4000
 PROPSPTH = "outputs_gen_props.pt" # calculates dataset props once so you don't have to redo it again
-DATASETPTH = "outputs_gen_int8/" # dataset folder path containing .pt files
-USEMEM = True # can cause OOM if dataset is big
+DATASETPTH = "outputs_gen_int8/" # quantized dataset folder path containing .pt files
+USEMEM = True # can cause OOM if dataset is big (for reference, 1 hour of INT8 at 30fps is around 16gb)
 
-# DATASETPTH_VAL = "outputs_gen_int8_val/" 
-# validating, unused
+
+assert 0 < SHIFTAMOUNT < BATCH, "SHIFTAMOUNT must be greater than 0 and less than BATCH"
+
 
 class JJSDataset(IterableDataset):
     def __init__(self, folder_path: str | Path, in_memory: bool = True):
@@ -85,10 +89,6 @@ class JJSDataset(IterableDataset):
 dataset = JJSDataset(DATASETPTH, USEMEM)
 dataloader = DataLoader(dataset=dataset, batch_size=None, num_workers=0)
 
-# dataset_val = JJSDataset(DATASETPTH_VAL, USEMEM)
-# dataloader_val = DataLoader(dataset=dataset_val, batch_size=None, num_workers=0)
-# validating, unused
-
 n = 0
 k_counts_per_key = torch.zeros(NUM_KEYS, 2)
 m_x_all = []
@@ -126,6 +126,7 @@ m_x_all = torch.stack(m_x_all).reshape(-1)
 m_y_all = torch.stack(m_y_all).reshape(-1)
 m_x_all_abs = torch.abs(m_x_all)
 m_y_all_abs = torch.abs(m_y_all)
+
 scale_x = torch.quantile(m_x_all_abs.float(), 0.99)
 scale_y = torch.quantile(m_y_all_abs.float(), 0.99)
 camera_maxval_x = scale_x.item()
@@ -160,8 +161,9 @@ dx_loss_fn = nn.CrossEntropyLoss(weight=x_weight.cuda())
 dy_loss_fn = nn.CrossEntropyLoss(weight=y_weight.cuda())
 
 
-model = mm.JJSYuji(mode="train", num_keys=NUM_KEYS,
-                   num_bins_x=NUM_BINS_X, num_bins_y=NUM_BINS_Y)
+sizes = {"num_keys": NUM_KEYS, "num_bins_x": NUM_BINS_X, "num_bins_y": NUM_BINS_Y,
+         "vsn_width": VSN_WIDTH, "vsn_height": VSN_HEIGHT}
+model = mm.JJSYuji(**sizes, mode="train")
 
 model.register_buffer("x_bins", x_bins)
 model.register_buffer("y_bins", y_bins)
@@ -186,21 +188,16 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(
     eta_min=(LR / 10)
 )
 
+seq_len = BATCH // BATCH_SPLITS
 
-bs = 4 # split individual videos into separate batches to introduce noise
-seq_len = BATCH // bs
-
-mouse_size = [bs * seq_len, NUM_BINS_X + NUM_BINS_Y]
-key_size = [bs, seq_len, NUM_KEYS]
-features_size = [bs, seq_len, 384, 15, 27]
-
-assert 0 <= SHIFTAMOUNT < BATCH
+mouse_size = [BATCH_SPLITS * seq_len, NUM_BINS_X + NUM_BINS_Y]
+key_size = [BATCH_SPLITS, seq_len, NUM_KEYS]
+features_size = [BATCH_SPLITS, seq_len, 384, VSN_HEIGHT // 16, VSN_WIDTH // 16]
 
 loss_mask = torch.ones(BATCH, dtype=torch.bool, device="cuda")
-if SHIFTAMOUNT > 0:
-    loss_mask[-SHIFTAMOUNT:] = False
+loss_mask[-SHIFTAMOUNT:] = False
 
-loss_mask_key = loss_mask.reshape(bs, seq_len)
+loss_mask_key = loss_mask.reshape(BATCH_SPLITS, seq_len)
 loss_mask_mouse = loss_mask.clone()
 
 
@@ -261,5 +258,5 @@ for i, batch in enumerate(dataloader):
     if updates == T_MAX:
         break
     updates += 1
-torch.save(model.state_dict(), SAVE_PATH)
+torch.save({"state_dict": model.state_dict(), "config": sizes}, SAVE_PATH)
 print("Training done!")

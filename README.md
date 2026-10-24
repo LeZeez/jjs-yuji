@@ -32,22 +32,24 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-### Settings
-Run `python gui.py` to pick your camera, mouse and keyboard and change the other settings. It creates `config.json` on first run, and both `recorder.py` and `inference.py` read from it. You can also edit `config.json` directly once it's created.
+### GUI
+Run `python gui.py`. Each tab (**Record**, **Play**, **Model**) has its own settings, saved to `config.json` (created on first run). `recorder.py` and `inference.py` read from it too, and you can also edit it directly.
 
-If your mouse or keyboard doesn't show up (e.g. on a laptop or with a keyboard+touchpad combo), untick **Strict device filter**.
+If your mouse or keyboard doesn't show up (e.g. on a laptop or with a keyboard+touchpad combo), untick **Strict device filter** in the Record tab.
 
 ### Run the pretrained model
 1. Download [`model.pt`](https://huggingface.co/TheZeez/jjs-yuji/blob/main/model.pt) into the repo root.
-2. In `gui.py`, set the camera to your capture device (OBS virtual camera or whatever capturing Roblox).
-3. Run `python inference.py`. Press `Ctrl+Alt+X` to stop.
+2. In the **Play** tab, set the camera to your capture device (OBS virtual camera or whatever is capturing Roblox).
+3. Press **Start** (it loads the model first if it isn't loaded). Press `Ctrl+Alt+X` to stop.
+
+Or run `python inference.py` without the GUI.
 
 ### Train your own
-Run the scripts in this order. Recording settings come from `config.json`, the other folder names are hard-coded at the top of each script.
-1. `recorder.py`: records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+X` to stop)
+Run these in order. Recording settings come from `config.json`, the other folder names are hard-coded at the top of each script.
+1. **Record** tab (or `recorder.py`): records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+X` to stop)
 2. `prepare_data.py`: extracts DINOv3 features from `dataset/` (move/rename `recorded/` to it) into `outputs_gen/`
 3. `int8_quantize.py`: quantizes the features into `outputs_gen_int8/` (required, `train.py` expects quantized features)
-4. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in `gui.py` to use it)
+4. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in the **Model** tab to use it)
 
 ## Architecture
 | | |
