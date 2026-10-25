@@ -149,13 +149,12 @@ def read_checkpoint(path):
 
 def load_model(path, mode: ModelMode = "train"):
     state_dict, sizes = read_checkpoint(path)
-    vision = Vision(sizes["vsn_width"], sizes["vsn_height"])
     model = JJSYuji(**sizes, mode=mode)
     model.register_buffer("x_bins", torch.zeros(sizes["num_bins_x"]))
     model.register_buffer("y_bins", torch.zeros(sizes["num_bins_y"]))
     model.register_buffer("key_thresh", torch.zeros(sizes["num_keys"]))
     model.load_state_dict(state_dict)
-    return model, vision, sizes
+    return model, sizes
 
 
 class ThreadModel:
@@ -180,7 +179,8 @@ class ThreadModel:
 
         try:
             # hardcoding eval/inference cuz not ideal for training anyway
-            model, vision, self.sizes = load_model(cfg.ckpt_path, mode="inference")
+            model, self.sizes = load_model(cfg.ckpt_path, mode="inference")
+            vision = Vision(self.sizes["vsn_width"], self.sizes["vsn_height"])
             model = model.to(device).eval()
             vision = vision.to(device).eval()
         except Exception as e:

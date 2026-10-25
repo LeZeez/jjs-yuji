@@ -1,5 +1,10 @@
 import torch
 from pathlib import Path
+from natsort import natsorted
+
+IN_PATH = "outputs_gen"
+VAL_EVERY = 10 # every 10th recording goes to validation.
+
 
 def quantize_file(src, dst):
     f = torch.load(src, map_location="cpu", mmap=True)
@@ -19,14 +24,14 @@ def quantize_file(src, dst):
     torch.save({"features_q": q, "features_scale": scale,
                 "keys": f["keys"], "mouse": f["mouse"]}, dst)
 
-IN_PATH = "outputs_gen"
 
-
-    
 in_quant = Path(IN_PATH)
 out_quant = Path(in_quant.name + "_int8")
+out_val = Path(in_quant.name + "_int8_val")
 out_quant.mkdir(exist_ok = True)
+out_val.mkdir(exist_ok = True)
 
-for raw_unq in in_quant.iterdir():
-    print(f"Quanting {raw_unq.name}...")
-    quantize_file(raw_unq, out_quant / raw_unq.name)
+for i, raw_unq in enumerate(natsorted(in_quant.iterdir())):
+    out = out_val if i % VAL_EVERY == VAL_EVERY - 1 else out_quant
+    print(f"Quanting {raw_unq.name} -> {out}...")
+    quantize_file(raw_unq, out / raw_unq.name)
