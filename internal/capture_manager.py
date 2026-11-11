@@ -32,6 +32,7 @@ class DataRecorder:
             frame_rate=fps,
             codec="libx264",
             preset="veryfast",
+            crf=18, # lower = better quality, default is 23
             extra_options={"threads": "2"}
         )
     def read(self):

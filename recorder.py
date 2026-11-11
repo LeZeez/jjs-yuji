@@ -29,26 +29,32 @@ def record(cfg: c.Config, event: threading.Event, on_status = dm.notfy):
     count = max([int(n) for n in nums if n.isdigit()] + [0]) + 1
     print("Starting with count", count)
 
-    fc = dm.FrameRecorder()
+    fc = dm.FrameRecorder(mouse, keyboard)
     recorder = cm.DataRecorder(rec.cam_idx, rec.width, rec.height, rec.fps, f"{rec.out_prefix}_{count}.mkv")
     on_status("Get ready. Recording in 5 seconds.")
+
     if event.wait(5):
+        # if it stops mid-wait
         recorder.release()
+        fc.stop()
         on_status("Stopped")
         return
+
     on_status("Recording")
 
     try:
         with recorder.open_file(), open(f"{rec.out_prefix}_{count}.jsonl", 'w') as f:
+            fc.get_frame_controls() # throw away the inputs from the countdown
             while True:
                 recorder.write()
-                frame_data = fc.get_frame_controls(mouse=mouse, keyboard=keyboard)
+                frame_data = fc.get_frame_controls()
                 f.write(json.dumps(frame_data) + "\n")
                 frames_recorded += 1
                 if event.is_set() and frames_recorded % rec.nearest_stop == 0:
                     break
     finally:
         recorder.release()
+        fc.stop()
     on_status("Done!")
 
 if __name__ == "__main__":

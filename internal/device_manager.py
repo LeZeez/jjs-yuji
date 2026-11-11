@@ -2,6 +2,9 @@ import numpy as np
 import evdev
 from evdev import InputDevice, UInput, ecodes as e
 from plyer import notification
+import threading
+import queue
+import select
 
 def notfy(message):
     notification.notify(title=message, timeout=1)
@@ -69,28 +72,60 @@ def soft_decode(logits, quantizer, num_bins):
     soft_index = (probs * np.arange(num_bins)).sum()
     return quantizer.undiscretize(soft_index)
 
-def _get_frame_controls(mouse: InputDevice, keyboard: InputDevice):
+class DeviceReader:
+    def __init__(self, device: InputDevice):
+        self.device = device
+        self.q = queue.Queue()
+        self.thread = threading.Thread(
+            target=self.run,
+            args=(self.device,),
+            daemon=True
+        )
+
+        self.thread.start()
+    def run(self, device: InputDevice):
+        while True:
+            try:
+                # read loop with timeout instead of device.read_loop(), which doesn't have timeout
+                ready, _, _ = select.select([device.fd], [], [], 0.1) 
+                if ready:
+                    for evts in device.read():
+                        self.q.put(evts)
+            except (OSError, ValueError):
+                break
+
+    def read(self):
+        items = []
+        while True:
+            try:
+                items.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return items
+
+    def stop(self):
+        self.device.close()
+        self.thread.join()
+
+def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader):
     frame_keys = {}
     frame_rel = {}
 
-    try:
-        for evt in keyboard.read():
-            # keyboard buttons
-            if evt.type == e.EV_KEY:
-                frame_keys[evt.code] = evt.value
-    except BlockingIOError:
-        pass
+    keyboard_evts = keyboard.read()
+    mouse_evts = mouse.read()
     
-    try:
-        for evt in mouse.read():
-            # mouse buttons
-            if evt.type == e.EV_KEY:
-                frame_keys[evt.code] = evt.value
-            # relative displacement
-            elif evt.type == e.EV_REL:
-                frame_rel[evt.code] = frame_rel.get(evt.code, 0) + evt.value
-    except BlockingIOError:
-        pass
+    for evt in keyboard_evts:
+        # keyboard buttons
+        if evt.type == e.EV_KEY:
+            frame_keys[evt.code] = evt.value
+
+    for evt in mouse_evts:
+        # mouse buttons
+        if evt.type == e.EV_KEY:
+            frame_keys[evt.code] = evt.value
+        # relative displacement
+        elif evt.type == e.EV_REL:
+            frame_rel[evt.code] = frame_rel.get(evt.code, 0) + evt.value
 
     frame_keys = {k:v for k,v in frame_keys.items() if v != 2}
 
@@ -98,21 +133,16 @@ def _get_frame_controls(mouse: InputDevice, keyboard: InputDevice):
 
 
 class FrameRecorder:
-    def __init__(self):
-        self.done = 0
+    def __init__(self, mouse: InputDevice, keyboard: InputDevice):
+        self.mouse = DeviceReader(mouse)
+        self.keyboard = DeviceReader(keyboard)
 
-    def get_frame_controls(self, mouse: InputDevice, keyboard: InputDevice):
-        if self.done == 0:
-            self.done += 1
+    def get_frame_controls(self):
+        return _get_frame_controls(self.mouse, self.keyboard)
 
-            # clear the buffer
-            for _ in range(5):
-                _get_frame_controls(mouse, keyboard)
-            
-            return {"keys": {}, "mouse": {}}
-
-        self.done += 1
-        return _get_frame_controls(mouse, keyboard)
+    def stop(self):
+        self.mouse.stop()
+        self.keyboard.stop()
         
 
 
