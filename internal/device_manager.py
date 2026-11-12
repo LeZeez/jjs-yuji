@@ -5,6 +5,7 @@ from plyer import notification
 import threading
 import queue
 import select
+import time
 
 def notfy(message):
     notification.notify(title=message, timeout=1)
@@ -64,13 +65,6 @@ def find_mouse(strict=True):
     return mice
 
 # RECORDING / READING
-
-# unusued for now
-def soft_decode(logits, quantizer, num_bins):
-    exp = np.exp(logits - logits.max())
-    probs = exp / exp.sum()
-    soft_index = (probs * np.arange(num_bins)).sum()
-    return quantizer.undiscretize(soft_index)
 
 class DeviceReader:
     def __init__(self, device: InputDevice):
@@ -183,19 +177,48 @@ REL = [
 def init_input_device(name: str):
     return UInput(CAPABILITIES, name=name)
 
-def smooth_mouse_exec(ui: UInput, code: int, value: int, precision: int = 5):
-    space = np.linspace(10, 20, precision)
-    space = space / space.sum()
-    values = space * value
-    values = np.round(values)
-    for i in range(precision):
-        ui.write(e.EV_REL, int(code), int(values[i]))
-        ui.syn()
+def split_move(value, precision):
+    weights = np.linspace(0, 1, precision)
+    totals = np.cumsum(weights) / weights.sum() * value   # running total after each part
+    totals = np.round(totals)
+    return np.diff(totals, prepend=0)
 
-def execute_frames(ui: UInput, frame_data: dict, mouse_constant: int | float = 1.0, precision: int = 5):
-    # apply displacement
-    for code, value in frame_data["mouse"].items():
-        smooth_mouse_exec(ui, code, (value * mouse_constant), precision=precision)
-    # apply pressed keys
-    for code, value in frame_data["keys"].items():
+def write_keys(ui, keys):
+    for code, value in keys.items():
         ui.write(e.EV_KEY, int(code), int(value))
+    ui.syn()
+
+def write_mouse_smooth(ui, mouse, fps, precision=5):
+    xs = split_move(mouse.get(str(e.REL_X), 0), precision)
+    ys = split_move(mouse.get(str(e.REL_Y), 0), precision)
+    for i in range(precision):
+        ui.write(e.EV_REL, e.REL_X, int(xs[i]))
+        ui.write(e.EV_REL, e.REL_Y, int(ys[i]))
+        ui.syn()
+        time.sleep(0.9 / fps / precision) # 90% of a frame, so it's done before the next frame arrives
+
+# writes keys + mouse in its own thread, because the mouse smoothing sleeps and would slow the play loop
+class DeviceWriter:
+    def __init__(self, ui, fps, precision=5):
+        self.ui = ui
+        self.fps = fps
+        self.precision = precision
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while True:
+            frame_data = self.q.get()
+            if frame_data is None:     # stop signal
+                break
+            write_keys(self.ui, frame_data["keys"])
+            mouse = {str(code): value for code, value in frame_data["mouse"].items()} # the model gives int keys, jsonl gives str
+            write_mouse_smooth(self.ui, mouse, self.fps, self.precision)
+
+    def write(self, frame_data):
+        self.q.put(frame_data)
+
+    def stop(self):
+        self.q.put(None)
+        self.thread.join()

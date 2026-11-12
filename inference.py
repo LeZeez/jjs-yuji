@@ -23,11 +23,14 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
         # == INFERENCE ==
         states = None
         with dm.init_input_device("TEST") as ui:
-            while not event.is_set():
-                frame = cam.read()
-                frame_data, states = model.generate(frame, states, cfg.play)
-                dm.execute_frames(ui, frame_data, 1, 1)
-                ui.syn()
+            writer = dm.DeviceWriter(ui, cap.fps)
+            try:
+                while not event.is_set():
+                    frame = cam.read()
+                    frame_data, states = model.generate(frame, states, cfg.play)
+                    writer.write(frame_data)
+            finally:
+                writer.stop()
     finally:
         cam.release()
         on_status("Stopped")
