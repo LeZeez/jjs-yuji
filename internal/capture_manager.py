@@ -1,4 +1,5 @@
 import cv2
+import time
 from torchcodec.encoders import Encoder
 import torch
 class DataRecorder:
@@ -41,15 +42,27 @@ class DataRecorder:
             return None
         return frame
 
+    def measure_fps(self):
+        # reads one second worth of frames, returns how long it really took (1.0 = camera matches fps)
+        for _ in range(5):
+            self.cam.read()  # warmup
+        start = time.monotonic()
+        for _ in range(round(self.fps)):
+            self.cam.read()
+        return time.monotonic() - start
+
     def open_file(self):
         return self.encoder.open_file(self.video_path)
     
     def write(self):
+        # returns whether a frame was written, so the inputs are only logged for real frames
         frame = self.read()
-        if frame is not None:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            tsr_frame = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
-            self.video_stream.add_frames(tsr_frame)
+        if frame is None:
+            return False
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tsr_frame = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+        self.video_stream.add_frames(tsr_frame)
+        return True
 
     def release(self):
         # release hardware handles clean when done

@@ -10,6 +10,7 @@ from cv2_enumerate_cameras import enumerate_cameras
 from pynput import keyboard as kb
 import internal.device_manager as dm
 import internal.model_manager as mm
+import internal.sound_manager as sm
 from internal.config import Config, CONFIG_PATH
 from recorder import record
 from inference import play
@@ -24,7 +25,7 @@ if not CONFIG_PATH.exists():
 def status_color(message):
     if message.startswith("Error"):
         return RED
-    if message.startswith(("Get ready", "Loading", "Stopping")):
+    if message.startswith(("Checking", "Get ready", "Loading", "Stopping")):
         return ORANGE
     if message.startswith(("Recording", "Playing", "Loaded")):
         return GREEN
@@ -170,10 +171,10 @@ class RunFrame(FormFrame):
         self.entry(self.SECTION, "fps", "FPS", int)
         self.add_settings()
 
-        self.notify_box = ctk.CTkCheckBox(self, text="Notifications")
-        if self.section.notify:
-            self.notify_box.select()
-        self.notify_box.grid(row=self.row, column=0, padx=10, pady=(15, 5), sticky="w")
+        self.sounds_box = ctk.CTkCheckBox(self, text="Sounds")
+        if self.section.sounds:
+            self.sounds_box.select()
+        self.sounds_box.grid(row=self.row, column=0, padx=10, pady=(15, 5), sticky="w")
         self.row += 1
         self.save_status = ctk.CTkLabel(self, text="")
         self.save_status.grid(row=self.row, column=0, padx=10, pady=10, sticky="w")
@@ -223,22 +224,23 @@ class RunFrame(FormFrame):
             self.save_status.configure(text=f"{bad} is not valid")
             return False
         self.section.cam_idx = int(self.cam_menu.get().split(":")[0])
-        self.section.notify = bool(self.notify_box.get())
+        self.section.sounds = bool(self.sounds_box.get())
         self.cfg.save()
         self.save_status.configure(text="Saved")
         return True
 
-    def on_status(self, message):
+    def on_status(self, message, sound=None):
         # called from the worker thread, so the label is only updated in poll()
+        # messages with a sound are the important ones, the rest only show here
         self.messages.put(message)
-        if self.section.notify:
-            dm.notfy(message)
+        if sound is not None and self.section.sounds:
+            sm.play_sound(sound)
 
     def run(self):
         try:
             self.work(self.event)
         except Exception as e:
-            self.on_status(f"Error: {e}")
+            self.on_status(f"Error: {e}", sound="error")
 
     def start(self):
         # run with what's on screen, not the last saved values
@@ -251,7 +253,7 @@ class RunFrame(FormFrame):
 
     def stop(self):
         if not self.event.is_set():
-            dm.stop_notfy(self.event, self.on_status)
+            dm.request_stop(self.event, self.on_status)
 
     def poll(self):
         while not self.messages.empty():

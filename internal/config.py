@@ -11,7 +11,7 @@ class CaptureConfig:
     width: int = 1280
     height: int = 720
     fps: int = 30
-    notify: bool = True
+    sounds: bool = True   # play a sound on countdown, start, stop, done and errors
 
 @dataclass
 class RecordConfig(CaptureConfig):

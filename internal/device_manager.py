@@ -1,18 +1,14 @@
 import numpy as np
 import evdev
 from evdev import InputDevice, UInput, ecodes as e
-from plyer import notification
 import threading
 import queue
 import select
 import time
 
-def notfy(message):
-    notification.notify(title=message, timeout=1)
-
-def stop_notfy(event, on_status):
+def request_stop(event, on_status):
     event.set()
-    on_status("Stopping...")
+    on_status("Stopping...", sound="stopping")
 
 # FINDING DEVICES
 
@@ -101,27 +97,25 @@ class DeviceReader:
         self.device.close()
         self.thread.join()
 
-def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader):
-    frame_keys = {}
+def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader, to_release: dict):
+    frame_keys = dict(to_release)  # releases moved over from the last frame
+    to_release.clear()
     frame_rel = {}
 
-    keyboard_evts = keyboard.read()
-    mouse_evts = mouse.read()
-    
-    for evt in keyboard_evts:
-        # keyboard buttons
+    # keyboard never sends EV_REL, so one loop works for both
+    for evt in keyboard.read() + mouse.read():
+        # keyboard and mouse buttons
         if evt.type == e.EV_KEY:
-            frame_keys[evt.code] = evt.value
-
-    for evt in mouse_evts:
-        # mouse buttons
-        if evt.type == e.EV_KEY:
-            frame_keys[evt.code] = evt.value
+            if evt.value == 2:
+                continue  # key repeat
+            if evt.value == 0 and frame_keys.get(evt.code) == 1:
+                to_release[evt.code] = 0  # pressed this frame, so release it next frame or the tap is lost
+            else:
+                frame_keys[evt.code] = evt.value
+                to_release.pop(evt.code, None)  # pressed again, so it's not released anymore
         # relative displacement
         elif evt.type == e.EV_REL:
             frame_rel[evt.code] = frame_rel.get(evt.code, 0) + evt.value
-
-    frame_keys = {k:v for k,v in frame_keys.items() if v != 2}
 
     return {"keys": frame_keys, "mouse": frame_rel}
 
@@ -130,9 +124,13 @@ class FrameRecorder:
     def __init__(self, mouse: InputDevice, keyboard: InputDevice):
         self.mouse = DeviceReader(mouse)
         self.keyboard = DeviceReader(keyboard)
+        self.to_release = {}
 
     def get_frame_controls(self):
-        return _get_frame_controls(self.mouse, self.keyboard)
+        # the reader threads only end on an error, so a dead one means the device is gone
+        if not (self.mouse.thread.is_alive() and self.keyboard.thread.is_alive()):
+            raise RuntimeError("Mouse or keyboard disconnected")
+        return _get_frame_controls(self.mouse, self.keyboard, self.to_release)
 
     def stop(self):
         self.mouse.stop()
