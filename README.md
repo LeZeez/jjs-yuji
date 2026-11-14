@@ -26,6 +26,16 @@
 - A CUDA GPU
 - Roblox via Sober (Flatpak `org.vinegarhq.Sober`)
 - OBS (virtual camera for Roblox)
+- Access to input devices:
+  - Recording reads `/dev/input`, add yourself to the `input` group (then log out and back in): 
+    ```bash
+    sudo usermod -aG input $USER
+    ```
+  - Playing writes to `/dev/uinput`. If you have Steam installed this already works, otherwise add a udev rule:
+    ```bash
+    echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/60-uinput.rules
+    sudo udevadm control --reload && sudo udevadm trigger --sysname-match=uinput
+    ```
 
 ```bash
 pip install -r requirements.txt

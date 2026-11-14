@@ -28,6 +28,8 @@ class PlayConfig(CaptureConfig):
     mouse_temp: float = 1.0
     kbrd_thresh_soften: float = 0.2   # the more it is the more the model is eager to press all buttons
                                       # (1.0 makes it press everything all at once)
+    mouse_precision: int = 5          # each frame's mouse move is split into this many steps over the frame
+                                      # (read when play starts, not every frame)
 
 # sizes (keys, mouse bins, vision) are read from the checkpoint
 @dataclass

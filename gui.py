@@ -2,6 +2,8 @@ import cv2
 import queue
 import threading
 import torch
+import tkinter as tk
+from pathlib import Path
 import customtkinter as ctk
 from customtkinter.windows.widgets.scaling import CTkScalingBaseClass
 from cv2_enumerate_cameras import enumerate_cameras
@@ -324,6 +326,7 @@ class PlayFrame(RunFrame):
         self.header("Controls")
         self.entry("play", "mouse_temp", "Mouse temp", float)
         self.entry("play", "kbrd_thresh_soften", "Key eagerness", float)
+        self.entry("play", "mouse_precision", "Mouse steps", int)
 
     def work(self, event):
         if self.app.model is None:
@@ -341,6 +344,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("JJS Yuji")
+        self.icon = tk.PhotoImage(file=Path(__file__).parent / "assets" / "icon.png") # keep a reference, or Tk throws the image away
+        self.iconphoto(True, self.icon)
         self.scale = 1.0
         self.resize_job = None
         self.model = None    # mm.ThreadModel, loaded from the Model or Play tab
