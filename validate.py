@@ -6,7 +6,7 @@ import internal.model_manager as mm
 import internal.mu as mu
 
 CKPT_PATH = "output_model.pt"
-VAL_PATH = "outputs_gen_int8_val/" # made by int8_quantize.py
+VAL_PATH = "outputs_gen_int8_val/" # made by prepare_data.py
 PROPSPTH = "outputs_gen_props.pt"  # made by train.py, for the same loss weights
 SHIFTAMOUNT = 2  # should match train.py
 BATCH_SPLITS = 4 # ^^^
@@ -54,7 +54,10 @@ files = natsorted(Path(VAL_PATH).iterdir())
 losses = torch.zeros(3) # keys, x, y
 for file in files:
     f = torch.load(file, map_location="cpu")
-    features = f["features_q"].cuda().float() * f["features_scale"].cuda().view(1, -1, 1, 1) # dequantize
+    features = f["features_q"].cuda().float()
+    scale = f["features_scale"].cuda()
+    scale = scale.unsqueeze(-1).unsqueeze(-1) # (frames, 384, 1, 1), a scale per frame and channel
+    features = features * scale # dequantize
     features = features.reshape(BATCH_SPLITS, -1, features.shape[1], feat_h, feat_w)
     keys = f["keys"].cuda().bool()
     mouse = f["mouse"].cuda().float()

@@ -57,9 +57,8 @@ Or run `python inference.py` without the GUI.
 ### Train your own
 Run these in order. Recording settings come from `config.json`, the other folder names are hard-coded at the top of each script.
 1. **Record** tab (or `recorder.py`): records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+X` to stop)
-2. `prepare_data.py`: extracts DINOv3 features from `dataset/` (move/rename `recorded/` to it) into `outputs_gen/`
-3. `int8_quantize.py`: quantizes the features into `outputs_gen_int8/` (required, `train.py` expects quantized features)
-4. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in the **Model** tab to use it)
+2. `prepare_data.py`: extracts DINOv3 features from `IN_PATHS` into `outputs_gen_int8/` (at the end, `VAL_COUNT` random new files are moved to `outputs_gen_int8_val/` for validation)
+3. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in the **Model** tab to use it)
 
 ## Architecture
 | | |

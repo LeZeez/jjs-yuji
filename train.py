@@ -212,7 +212,8 @@ for i, batch in enumerate(dataloader):
         continue
 
     features = features[:BATCH].cuda()
-    scale = scale.cuda().view(1, 384, 1, 1)
+    scale = scale[:BATCH].cuda()
+    scale = scale.unsqueeze(-1).unsqueeze(-1) # (BATCH, 384, 1, 1), a scale per frame and channel
     target_keys = target_keys[:BATCH]
     target_mouse = target_mouse[:BATCH]
 

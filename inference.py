@@ -30,6 +30,8 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
             try:
                 while not event.is_set():
                     frame = cam.read()
+                    if frame is None:
+                        continue  # camera gave no frame, try again
                     frame_data, states = model.generate(frame, states, cfg.play)
                     writer.write(frame_data)
             finally:
