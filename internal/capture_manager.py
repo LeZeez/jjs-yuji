@@ -50,21 +50,23 @@ class DataRecorder:
     @contextmanager
     def open_file(self):
         self.container = av.open(self.video_path, "w")
-        options = {
-            "coder": "range_def", # ~15% smaller than the default coder, still lossless
-            "threads": "2",
-        }
-        self.stream = self.container.add_stream("ffv1", rate=round(self.fps), options=options) # FFV1 is always lossless
-        self.stream.width = self.width
-        self.stream.height = self.height
-        self.stream.pix_fmt = "bgr0" # FFV1 has no bgr24, bgr0 is BGR plus an unused byte
         try:
-            yield
+            options = {
+                "coder": "range_def", # ~15% smaller than the default coder, still lossless
+                "threads": "2",
+            }
+            self.stream = self.container.add_stream("ffv1", rate=round(self.fps), options=options) # FFV1 is always lossless
+            self.stream.width = self.width
+            self.stream.height = self.height
+            self.stream.pix_fmt = "bgr0" # FFV1 has no bgr24, bgr0 is BGR plus an unused byte
+            try:
+                yield
+            finally:
+                packets = self.stream.encode()  # no (frame) = flush the frames the encoder still holds
+                for packet in packets:
+                    self.container.mux(packet)
         finally:
-            packets = self.stream.encode()  # no (frame) = flush the frames the encoder still holds
-            for packet in packets:
-                self.container.mux(packet)
-            self.container.close()
+            self.container.close()  # also when the setup or the flush fails
 
     def write(self):
         # returns whether a frame was written, so the inputs are only logged for real frames

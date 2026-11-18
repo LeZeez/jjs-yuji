@@ -22,6 +22,14 @@ if not CONFIG_PATH.exists():
     Config().save()
 
 
+def positive_int(text):
+    # whole numbers from 1 up (countdown: 0 is what the checkbox is for, mouse steps: 0 never moves the mouse)
+    number = int(text)
+    if number < 1:
+        raise ValueError(text)
+    return number
+
+
 def status_color(message):
     if message.startswith("Error"):
         return RED
@@ -78,6 +86,7 @@ class ModelFrame(FormFrame):
         super().__init__(master, cfg)
         self.app = app
         self.shown = None  # last status, to only redraw on change
+        self.error = None  # last load error, shown until the next load
 
         self.header("Model")
         self.entry("model", "ckpt_path", "Checkpoint", str)
@@ -104,6 +113,7 @@ class ModelFrame(FormFrame):
             self.status.configure(text=f"{bad} is not valid", text_color=RED)
             return
         self.cfg.save()
+        self.error = None
         self.app.model = mm.ThreadModel(self.cfg.model, "cuda")
 
     def unload(self):
@@ -122,13 +132,18 @@ class ModelFrame(FormFrame):
 
     def poll(self):
         model = self.app.model
+        # a failed load (from here or the Play tab) is dropped, so Load works again without Unload
+        if model is not None and model.ready.is_set() and model.load_error is not None:
+            self.error = f"Error: {model.load_error}"
+            model.stop()
+            self.app.model = None
+            model = None
+
         loading = model is not None and not model.ready.is_set()
         if model is None:
-            text = "Not loaded"
+            text = self.error or "Not loaded"
         elif loading:
             text = "Loading..."
-        elif model.load_error is not None:
-            text = f"Error: {model.load_error}"
         else:
             s = model.sizes
             text = (f"Loaded: {model.cfg.ckpt_path}\n{s['num_keys']} keys, "
@@ -183,6 +198,17 @@ class RunFrame(FormFrame):
 
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=0, column=2, rowspan=self.row, padx=(40, 10))
+        countdown_row = ctk.CTkFrame(controls, fg_color="transparent")
+        countdown_row.pack()
+        self.countdown_box = ctk.CTkCheckBox(countdown_row, text="Countdown (s)", command=self.toggle_countdown)
+        if self.section.use_countdown:
+            self.countdown_box.select()
+        self.countdown_box.pack(side="left", padx=5)
+        self.countdown_entry = ctk.CTkEntry(countdown_row, width=50)
+        self.countdown_entry.insert(0, str(self.section.countdown))
+        self.countdown_entry.pack(side="left", padx=5)
+        self.entries.append((self.SECTION, "countdown", "Countdown", positive_int, self.countdown_entry))
+        self.toggle_countdown()
         buttons = ctk.CTkFrame(controls, fg_color="transparent")
         buttons.pack(pady=10)
         self.start_btn = ctk.CTkButton(buttons, text="Start", command=self.start)
@@ -194,6 +220,8 @@ class RunFrame(FormFrame):
         self.status = ctk.CTkLabel(controls, text="Idle", text_color="gray", wraplength=300,
                                    font=ctk.CTkFont(size=24, weight="bold"))
         self.status.pack(pady=20)
+        ctk.CTkLabel(controls, text="Ctrl+Alt+Z starts this tab from anywhere", text_color="gray",
+                     font=ctk.CTkFont(size=11)).pack()
         ctk.CTkLabel(controls, text="Ctrl+Alt+X stops it from anywhere", text_color="gray",
                      font=ctk.CTkFont(size=11)).pack()
 
@@ -202,6 +230,15 @@ class RunFrame(FormFrame):
 
     def add_settings(self):
         pass
+
+    def toggle_countdown(self):
+        # greyed out keeps the number, so ticking it again brings it back
+        # (a disabled CTkEntry looks the same, so the text color is changed by hand)
+        if self.countdown_box.get():
+            text_color = ctk.ThemeManager.theme["CTkEntry"]["text_color"]
+            self.countdown_entry.configure(state="normal", text_color=text_color)
+        else:
+            self.countdown_entry.configure(state="disabled", text_color="gray40")
 
     def work(self, event):
         raise NotImplementedError
@@ -225,6 +262,7 @@ class RunFrame(FormFrame):
             return False
         self.section.cam_idx = int(self.cam_menu.get().split(":")[0])
         self.section.sounds = bool(self.sounds_box.get())
+        self.section.use_countdown = bool(self.countdown_box.get())
         self.cfg.save()
         self.save_status.configure(text="Saved")
         return True
@@ -328,7 +366,7 @@ class PlayFrame(RunFrame):
         self.header("Controls")
         self.entry("play", "mouse_temp", "Mouse temp", float)
         self.entry("play", "kbrd_thresh_soften", "Key eagerness", float)
-        self.entry("play", "mouse_precision", "Mouse steps", int)
+        self.entry("play", "mouse_precision", "Mouse steps", positive_int)
 
     def work(self, event):
         if self.app.model is None:
@@ -356,8 +394,12 @@ class App(ctk.CTk):
         cfg = Config.load()
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(padx=20, pady=20, fill="both", expand=True)
-        RecordFrame(self.tabs.add("Record"), cfg, self).pack(expand=True)
-        PlayFrame(self.tabs.add("Play"), cfg, self).pack(expand=True)
+        self.run_frames = {
+            "Record": RecordFrame(self.tabs.add("Record"), cfg, self),
+            "Play": PlayFrame(self.tabs.add("Play"), cfg, self),
+        }
+        for frame in self.run_frames.values():
+            frame.pack(expand=True)
         ModelFrame(self.tabs.add("Model"), cfg, self).pack(expand=True)
 
         self.natural_w, self.natural_h = self.measure()
@@ -366,7 +408,21 @@ class App(ctk.CTk):
         self.bind("<Configure>", self.on_resize)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         # Roblox has focus while recording / playing, so the Stop button can't be clicked
-        kb.GlobalHotKeys({'<ctrl>+<alt>+x': self.stop_running}).start()
+        # Z and X aren't keys the model learns, so pressing them doesn't dirty the data
+        kb.GlobalHotKeys({
+            '<ctrl>+<alt>+z': self.start_shown_tab,
+            '<ctrl>+<alt>+x': self.stop_running,
+        }).start()
+
+    def start_shown_tab(self):
+        # the hotkey fires on pynput's thread, start() reads the entries so it has to run on Tk's
+        self.after(0, self._start_shown_tab)
+
+    def _start_shown_tab(self):
+        frame = self.run_frames.get(self.tabs.get())  # None on the Model tab
+        if frame is None or self.running is not None:
+            return
+        frame.start()
 
     def stop_running(self):
         running = self.running

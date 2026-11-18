@@ -21,6 +21,8 @@ class RecordConfig(CaptureConfig):
                                       # turn off for laptops / combo devices
     out_prefix: str = "recorded/rec"  # folder + file prefix, the number is added automatically (e.g., recorded/rec_1)
     nearest_stop: int = 3584          # recording stops when frames are divisible by this (divisible by 128 for mLSTM kernel)
+    use_countdown: bool = True
+    countdown: int = 3                # seconds before recording starts
 
 # read every frame, no reload needed
 @dataclass
@@ -30,6 +32,8 @@ class PlayConfig(CaptureConfig):
                                       # (1.0 makes it press everything all at once)
     mouse_precision: int = 5          # each frame's mouse move is split into this many steps over the frame
                                       # (read when play starts, not every frame)
+    use_countdown: bool = True
+    countdown: int = 3                # seconds before playing starts
 
 # sizes (keys, mouse bins, vision) are read from the checkpoint
 @dataclass

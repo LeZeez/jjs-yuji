@@ -7,8 +7,8 @@ import select
 import time
 
 def request_stop(event, on_status):
-    event.set()
     on_status("Stopping...", sound="stopping")
+    event.set()
 
 # FINDING DEVICES
 
@@ -97,13 +97,18 @@ class DeviceReader:
         self.device.close()
         self.thread.join()
 
-def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader, to_release: dict):
+def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader | None, to_release: dict):
     frame_keys = dict(to_release)  # releases moved over from the last frame
     to_release.clear()
     frame_rel = {}
 
+    # keyboard is None when one combo device is both, its reader already has the keys
+    events = mouse.read()
+    if keyboard is not None:
+        events = keyboard.read() + events
+
     # keyboard never sends EV_REL, so one loop works for both
-    for evt in keyboard.read() + mouse.read():
+    for evt in events:
         # keyboard and mouse buttons
         if evt.type == e.EV_KEY:
             if evt.value == 2:
@@ -123,18 +128,28 @@ def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader, to_release:
 class FrameRecorder:
     def __init__(self, mouse: InputDevice, keyboard: InputDevice):
         self.mouse = DeviceReader(mouse)
-        self.keyboard = DeviceReader(keyboard)
+        self.keyboard = None
+        if keyboard.path == mouse.path:
+            # the same combo device picked for both, two readers would get every event twice (doubled mouse)
+            keyboard.close()
+        else:
+            self.keyboard = DeviceReader(keyboard)
         self.to_release = {}
+
+    def readers(self):
+        if self.keyboard is None:
+            return [self.mouse]
+        return [self.mouse, self.keyboard]
 
     def get_frame_controls(self):
         # the reader threads only end on an error, so a dead one means the device is gone
-        if not (self.mouse.thread.is_alive() and self.keyboard.thread.is_alive()):
+        if not all(reader.thread.is_alive() for reader in self.readers()):
             raise RuntimeError("Mouse or keyboard disconnected")
         return _get_frame_controls(self.mouse, self.keyboard, self.to_release)
 
     def stop(self):
-        self.mouse.stop()
-        self.keyboard.stop()
+        for reader in self.readers():
+            reader.stop()
         
 
 
@@ -176,6 +191,8 @@ def init_input_device(name: str):
     return UInput(CAPABILITIES, name=name)
 
 def split_move(value, precision):
+    if precision == 1:
+        return np.array([float(value)])  # one step, the weights below would all be 0 and divide by 0
     weights = np.linspace(0, 1, precision)
     totals = np.cumsum(weights) / weights.sum() * value   # running total after each part
     totals = np.round(totals)
@@ -202,19 +219,26 @@ class DeviceWriter:
         self.fps = fps
         self.precision = precision
         self.q = queue.Queue()
+        self.error = None  # set if the thread dies, write() raises it in the play loop
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
     def run(self):
-        while True:
-            frame_data = self.q.get()
-            if frame_data is None:     # stop signal
-                break
-            write_keys(self.ui, frame_data["keys"])
-            mouse = {str(code): value for code, value in frame_data["mouse"].items()} # the model gives int keys, jsonl gives str
-            write_mouse_smooth(self.ui, mouse, self.fps, self.precision)
+        try:
+            while True:
+                frame_data = self.q.get()
+                if frame_data is None:     # stop signal
+                    break
+                write_keys(self.ui, frame_data["keys"])
+                mouse = {str(code): value for code, value in frame_data["mouse"].items()} # the model gives int keys, jsonl gives str
+                write_mouse_smooth(self.ui, mouse, self.fps, self.precision)
+        except Exception as error:
+            self.error = error
 
     def write(self, frame_data):
+        # otherwise play keeps showing "Playing" while nothing reaches the game
+        if not self.thread.is_alive():
+            raise RuntimeError(f"Input writer stopped: {self.error}")
         self.q.put(frame_data)
 
     def stop(self):

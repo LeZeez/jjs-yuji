@@ -33,7 +33,11 @@ def record(cfg: c.Config, event: threading.Event, on_status = sm.terminal_status
     print("Starting with count", count)
 
     fc = dm.FrameRecorder(mouse, keyboard)
-    recorder = cm.DataRecorder(rec.cam_idx, rec.width, rec.height, rec.fps, f"{rec.out_prefix}_{count}.mkv")
+    try:
+        recorder = cm.DataRecorder(rec.cam_idx, rec.width, rec.height, rec.fps, f"{rec.out_prefix}_{count}.mkv")
+    except Exception:
+        fc.stop()  # or the mouse/keyboard readers keep running after a failed start
+        raise
 
     # the camera can ignore the requested fps, check it before recording
     on_status("Checking camera FPS...")  # no sound, it only takes a second
@@ -43,8 +47,16 @@ def record(cfg: c.Config, event: threading.Event, on_status = sm.terminal_status
         fc.stop()
         raise RuntimeError(f"Camera runs at {rec.fps / seconds:.1f} fps, not {rec.fps}")
 
+    if event.is_set():
+        # stopped while checking the camera
+        recorder.release()
+        fc.stop()
+        on_status("Stopped")
+        return
+
     # a tick every second of the countdown
-    for seconds_left in range(5, 0, -1):
+    countdown = rec.countdown if rec.use_countdown else 0
+    for seconds_left in range(countdown, 0, -1):
         on_status(f"Get ready. Recording in {seconds_left}...", sound="countdown")
         if event.wait(1):
             # if it stops mid-wait

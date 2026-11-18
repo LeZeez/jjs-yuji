@@ -17,7 +17,8 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
             model.generate(warmup, None, cfg.play)
 
         # a tick every second of the countdown
-        for seconds_left in range(3, 0, -1):
+        countdown = cap.countdown if cap.use_countdown else 0
+        for seconds_left in range(countdown, 0, -1):
             on_status(f"Get ready. Playing in {seconds_left}...", sound="countdown")
             if event.wait(1):
                 return
@@ -28,10 +29,16 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
         with dm.init_input_device("TEST") as ui:
             writer = dm.DeviceWriter(ui, cap.fps, cap.mouse_precision)
             try:
+                failed = 0
                 while not event.is_set():
                     frame = cam.read()
                     if frame is None:
-                        continue  # camera gave no frame, try again
+                        # same as the recorder: a few misses are fine, a dead camera is an error
+                        failed += 1
+                        if failed >= 30:
+                            raise RuntimeError("Camera stopped returning frames")
+                        continue
+                    failed = 0
                     frame_data, states = model.generate(frame, states, cfg.play)
                     writer.write(frame_data)
             finally:

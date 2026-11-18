@@ -50,13 +50,13 @@ If your mouse or keyboard doesn't show up (e.g. on a laptop or with a keyboard+t
 ### Run the pretrained model
 1. Download [`model.pt`](https://huggingface.co/TheZeez/jjs-yuji/blob/main/model.pt) into the repo root.
 2. In the **Play** tab, set the camera to your capture device (OBS virtual camera or whatever is capturing Roblox).
-3. Press **Start** (it loads the model first if it isn't loaded). Press `Ctrl+Alt+X` to stop.
+3. Press **Start** or `Ctrl+Alt+Z` (it loads the model first if it isn't loaded). Press `Ctrl+Alt+X` to stop.
 
 Or run `python inference.py` without the GUI.
 
 ### Train your own
 Run these in order. Recording settings come from `config.json`, the other folder names are hard-coded at the top of each script.
-1. **Record** tab (or `recorder.py`): records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+X` to stop)
+1. **Record** tab (or `recorder.py`): records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+Z` to start from the GUI, `Ctrl+Alt+X` to stop)
 2. `prepare_data.py`: extracts DINOv3 features from `IN_PATHS` into `outputs_gen_int8/` (at the end, `VAL_COUNT` random new files are moved to `outputs_gen_int8_val/` for validation)
 3. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in the **Model** tab to use it)
 
