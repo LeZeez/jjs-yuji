@@ -2,12 +2,15 @@ import cv2
 import queue
 import threading
 import torch
+import tkinter as tk
+from pathlib import Path
 import customtkinter as ctk
 from customtkinter.windows.widgets.scaling import CTkScalingBaseClass
 from cv2_enumerate_cameras import enumerate_cameras
 from pynput import keyboard as kb
 import internal.device_manager as dm
 import internal.model_manager as mm
+import internal.sound_manager as sm
 from internal.config import Config, CONFIG_PATH
 from recorder import record
 from inference import play
@@ -19,10 +22,18 @@ if not CONFIG_PATH.exists():
     Config().save()
 
 
+def positive_int(text):
+    # whole numbers from 1 up (countdown: 0 is what the checkbox is for, mouse steps: 0 never moves the mouse)
+    number = int(text)
+    if number < 1:
+        raise ValueError(text)
+    return number
+
+
 def status_color(message):
     if message.startswith("Error"):
         return RED
-    if message.startswith(("Get ready", "Loading", "Stopping")):
+    if message.startswith(("Checking", "Get ready", "Loading", "Stopping")):
         return ORANGE
     if message.startswith(("Recording", "Playing", "Loaded")):
         return GREEN
@@ -75,6 +86,7 @@ class ModelFrame(FormFrame):
         super().__init__(master, cfg)
         self.app = app
         self.shown = None  # last status, to only redraw on change
+        self.error = None  # last load error, shown until the next load
 
         self.header("Model")
         self.entry("model", "ckpt_path", "Checkpoint", str)
@@ -101,6 +113,7 @@ class ModelFrame(FormFrame):
             self.status.configure(text=f"{bad} is not valid", text_color=RED)
             return
         self.cfg.save()
+        self.error = None
         self.app.model = mm.ThreadModel(self.cfg.model, "cuda")
 
     def unload(self):
@@ -119,13 +132,18 @@ class ModelFrame(FormFrame):
 
     def poll(self):
         model = self.app.model
+        # a failed load (from here or the Play tab) is dropped, so Load works again without Unload
+        if model is not None and model.ready.is_set() and model.load_error is not None:
+            self.error = f"Error: {model.load_error}"
+            model.stop()
+            self.app.model = None
+            model = None
+
         loading = model is not None and not model.ready.is_set()
         if model is None:
-            text = "Not loaded"
+            text = self.error or "Not loaded"
         elif loading:
             text = "Loading..."
-        elif model.load_error is not None:
-            text = f"Error: {model.load_error}"
         else:
             s = model.sizes
             text = (f"Loaded: {model.cfg.ckpt_path}\n{s['num_keys']} keys, "
@@ -168,10 +186,10 @@ class RunFrame(FormFrame):
         self.entry(self.SECTION, "fps", "FPS", int)
         self.add_settings()
 
-        self.notify_box = ctk.CTkCheckBox(self, text="Notifications")
-        if self.section.notify:
-            self.notify_box.select()
-        self.notify_box.grid(row=self.row, column=0, padx=10, pady=(15, 5), sticky="w")
+        self.sounds_box = ctk.CTkCheckBox(self, text="Sounds")
+        if self.section.sounds:
+            self.sounds_box.select()
+        self.sounds_box.grid(row=self.row, column=0, padx=10, pady=(15, 5), sticky="w")
         self.row += 1
         self.save_status = ctk.CTkLabel(self, text="")
         self.save_status.grid(row=self.row, column=0, padx=10, pady=10, sticky="w")
@@ -180,6 +198,17 @@ class RunFrame(FormFrame):
 
         controls = ctk.CTkFrame(self, fg_color="transparent")
         controls.grid(row=0, column=2, rowspan=self.row, padx=(40, 10))
+        countdown_row = ctk.CTkFrame(controls, fg_color="transparent")
+        countdown_row.pack()
+        self.countdown_box = ctk.CTkCheckBox(countdown_row, text="Countdown (s)", command=self.toggle_countdown)
+        if self.section.use_countdown:
+            self.countdown_box.select()
+        self.countdown_box.pack(side="left", padx=5)
+        self.countdown_entry = ctk.CTkEntry(countdown_row, width=50)
+        self.countdown_entry.insert(0, str(self.section.countdown))
+        self.countdown_entry.pack(side="left", padx=5)
+        self.entries.append((self.SECTION, "countdown", "Countdown", positive_int, self.countdown_entry))
+        self.toggle_countdown()
         buttons = ctk.CTkFrame(controls, fg_color="transparent")
         buttons.pack(pady=10)
         self.start_btn = ctk.CTkButton(buttons, text="Start", command=self.start)
@@ -191,6 +220,8 @@ class RunFrame(FormFrame):
         self.status = ctk.CTkLabel(controls, text="Idle", text_color="gray", wraplength=300,
                                    font=ctk.CTkFont(size=24, weight="bold"))
         self.status.pack(pady=20)
+        ctk.CTkLabel(controls, text="Ctrl+Alt+Z starts this tab from anywhere", text_color="gray",
+                     font=ctk.CTkFont(size=11)).pack()
         ctk.CTkLabel(controls, text="Ctrl+Alt+X stops it from anywhere", text_color="gray",
                      font=ctk.CTkFont(size=11)).pack()
 
@@ -199,6 +230,15 @@ class RunFrame(FormFrame):
 
     def add_settings(self):
         pass
+
+    def toggle_countdown(self):
+        # greyed out keeps the number, so ticking it again brings it back
+        # (a disabled CTkEntry looks the same, so the text color is changed by hand)
+        if self.countdown_box.get():
+            text_color = ctk.ThemeManager.theme["CTkEntry"]["text_color"]
+            self.countdown_entry.configure(state="normal", text_color=text_color)
+        else:
+            self.countdown_entry.configure(state="disabled", text_color="gray40")
 
     def work(self, event):
         raise NotImplementedError
@@ -221,22 +261,24 @@ class RunFrame(FormFrame):
             self.save_status.configure(text=f"{bad} is not valid")
             return False
         self.section.cam_idx = int(self.cam_menu.get().split(":")[0])
-        self.section.notify = bool(self.notify_box.get())
+        self.section.sounds = bool(self.sounds_box.get())
+        self.section.use_countdown = bool(self.countdown_box.get())
         self.cfg.save()
         self.save_status.configure(text="Saved")
         return True
 
-    def on_status(self, message):
+    def on_status(self, message, sound=None):
         # called from the worker thread, so the label is only updated in poll()
+        # messages with a sound are the important ones, the rest only show here
         self.messages.put(message)
-        if self.section.notify:
-            dm.notfy(message)
+        if sound is not None and self.section.sounds:
+            sm.play_sound(sound)
 
     def run(self):
         try:
             self.work(self.event)
         except Exception as e:
-            self.on_status(f"Error: {e}")
+            self.on_status(f"Error: {e}", sound="error")
 
     def start(self):
         # run with what's on screen, not the last saved values
@@ -249,7 +291,7 @@ class RunFrame(FormFrame):
 
     def stop(self):
         if not self.event.is_set():
-            dm.stop_notfy(self.event, self.on_status)
+            dm.request_stop(self.event, self.on_status)
 
     def poll(self):
         while not self.messages.empty():
@@ -324,6 +366,7 @@ class PlayFrame(RunFrame):
         self.header("Controls")
         self.entry("play", "mouse_temp", "Mouse temp", float)
         self.entry("play", "kbrd_thresh_soften", "Key eagerness", float)
+        self.entry("play", "mouse_precision", "Mouse steps", positive_int)
 
     def work(self, event):
         if self.app.model is None:
@@ -341,6 +384,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("JJS Yuji")
+        self.icon = tk.PhotoImage(file=Path(__file__).parent / "assets" / "icon.png") # keep a reference, or Tk throws the image away
+        self.iconphoto(True, self.icon)
         self.scale = 1.0
         self.resize_job = None
         self.model = None    # mm.ThreadModel, loaded from the Model or Play tab
@@ -349,8 +394,12 @@ class App(ctk.CTk):
         cfg = Config.load()
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(padx=20, pady=20, fill="both", expand=True)
-        RecordFrame(self.tabs.add("Record"), cfg, self).pack(expand=True)
-        PlayFrame(self.tabs.add("Play"), cfg, self).pack(expand=True)
+        self.run_frames = {
+            "Record": RecordFrame(self.tabs.add("Record"), cfg, self),
+            "Play": PlayFrame(self.tabs.add("Play"), cfg, self),
+        }
+        for frame in self.run_frames.values():
+            frame.pack(expand=True)
         ModelFrame(self.tabs.add("Model"), cfg, self).pack(expand=True)
 
         self.natural_w, self.natural_h = self.measure()
@@ -359,7 +408,21 @@ class App(ctk.CTk):
         self.bind("<Configure>", self.on_resize)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         # Roblox has focus while recording / playing, so the Stop button can't be clicked
-        kb.GlobalHotKeys({'<ctrl>+<alt>+x': self.stop_running}).start()
+        # Z and X aren't keys the model learns, so pressing them doesn't dirty the data
+        kb.GlobalHotKeys({
+            '<ctrl>+<alt>+z': self.start_shown_tab,
+            '<ctrl>+<alt>+x': self.stop_running,
+        }).start()
+
+    def start_shown_tab(self):
+        # the hotkey fires on pynput's thread, start() reads the entries so it has to run on Tk's
+        self.after(0, self._start_shown_tab)
+
+    def _start_shown_tab(self):
+        frame = self.run_frames.get(self.tabs.get())  # None on the Model tab
+        if frame is None or self.running is not None:
+            return
+        frame.start()
 
     def stop_running(self):
         running = self.running

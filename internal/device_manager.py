@@ -1,14 +1,14 @@
 import numpy as np
 import evdev
 from evdev import InputDevice, UInput, ecodes as e
-from plyer import notification
+import threading
+import queue
+import select
+import time
 
-def notfy(message):
-    notification.notify(title=message, timeout=1)
-
-def stop_notfy(event, on_status):
+def request_stop(event, on_status):
+    on_status("Stopping...", sound="stopping")
     event.set()
-    on_status("Stopping...")
 
 # FINDING DEVICES
 
@@ -62,57 +62,94 @@ def find_mouse(strict=True):
 
 # RECORDING / READING
 
-# unusued for now
-def soft_decode(logits, quantizer, num_bins):
-    exp = np.exp(logits - logits.max())
-    probs = exp / exp.sum()
-    soft_index = (probs * np.arange(num_bins)).sum()
-    return quantizer.undiscretize(soft_index)
+class DeviceReader:
+    def __init__(self, device: InputDevice):
+        self.device = device
+        self.q = queue.Queue()
+        self.thread = threading.Thread(
+            target=self.run,
+            args=(self.device,),
+            daemon=True
+        )
 
-def _get_frame_controls(mouse: InputDevice, keyboard: InputDevice):
-    frame_keys = {}
+        self.thread.start()
+    def run(self, device: InputDevice):
+        while True:
+            try:
+                # read loop with timeout instead of device.read_loop(), which doesn't have timeout
+                ready, _, _ = select.select([device.fd], [], [], 0.1) 
+                if ready:
+                    for evts in device.read():
+                        self.q.put(evts)
+            except (OSError, ValueError):
+                break
+
+    def read(self):
+        items = []
+        while True:
+            try:
+                items.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        return items
+
+    def stop(self):
+        self.device.close()
+        self.thread.join()
+
+def _get_frame_controls(mouse: DeviceReader, keyboard: DeviceReader | None, to_release: dict):
+    frame_keys = dict(to_release)  # releases moved over from the last frame
+    to_release.clear()
     frame_rel = {}
 
-    try:
-        for evt in keyboard.read():
-            # keyboard buttons
-            if evt.type == e.EV_KEY:
-                frame_keys[evt.code] = evt.value
-    except BlockingIOError:
-        pass
-    
-    try:
-        for evt in mouse.read():
-            # mouse buttons
-            if evt.type == e.EV_KEY:
-                frame_keys[evt.code] = evt.value
-            # relative displacement
-            elif evt.type == e.EV_REL:
-                frame_rel[evt.code] = frame_rel.get(evt.code, 0) + evt.value
-    except BlockingIOError:
-        pass
+    # keyboard is None when one combo device is both, its reader already has the keys
+    events = mouse.read()
+    if keyboard is not None:
+        events = keyboard.read() + events
 
-    frame_keys = {k:v for k,v in frame_keys.items() if v != 2}
+    # keyboard never sends EV_REL, so one loop works for both
+    for evt in events:
+        # keyboard and mouse buttons
+        if evt.type == e.EV_KEY:
+            if evt.value == 2:
+                continue  # key repeat
+            if evt.value == 0 and frame_keys.get(evt.code) == 1:
+                to_release[evt.code] = 0  # pressed this frame, so release it next frame or the tap is lost
+            else:
+                frame_keys[evt.code] = evt.value
+                to_release.pop(evt.code, None)  # pressed again, so it's not released anymore
+        # relative displacement
+        elif evt.type == e.EV_REL:
+            frame_rel[evt.code] = frame_rel.get(evt.code, 0) + evt.value
 
     return {"keys": frame_keys, "mouse": frame_rel}
 
 
 class FrameRecorder:
-    def __init__(self):
-        self.done = 0
+    def __init__(self, mouse: InputDevice, keyboard: InputDevice):
+        self.mouse = DeviceReader(mouse)
+        self.keyboard = None
+        if keyboard.path == mouse.path:
+            # the same combo device picked for both, two readers would get every event twice (doubled mouse)
+            keyboard.close()
+        else:
+            self.keyboard = DeviceReader(keyboard)
+        self.to_release = {}
 
-    def get_frame_controls(self, mouse: InputDevice, keyboard: InputDevice):
-        if self.done == 0:
-            self.done += 1
+    def readers(self):
+        if self.keyboard is None:
+            return [self.mouse]
+        return [self.mouse, self.keyboard]
 
-            # clear the buffer
-            for _ in range(5):
-                _get_frame_controls(mouse, keyboard)
-            
-            return {"keys": {}, "mouse": {}}
+    def get_frame_controls(self):
+        # the reader threads only end on an error, so a dead one means the device is gone
+        if not all(reader.thread.is_alive() for reader in self.readers()):
+            raise RuntimeError("Mouse or keyboard disconnected")
+        return _get_frame_controls(self.mouse, self.keyboard, self.to_release)
 
-        self.done += 1
-        return _get_frame_controls(mouse, keyboard)
+    def stop(self):
+        for reader in self.readers():
+            reader.stop()
         
 
 
@@ -153,19 +190,57 @@ REL = [
 def init_input_device(name: str):
     return UInput(CAPABILITIES, name=name)
 
-def smooth_mouse_exec(ui: UInput, code: int, value: int, precision: int = 5):
-    space = np.linspace(10, 20, precision)
-    space = space / space.sum()
-    values = space * value
-    values = np.round(values)
-    for i in range(precision):
-        ui.write(e.EV_REL, int(code), int(values[i]))
-        ui.syn()
+def split_move(value, precision):
+    if precision == 1:
+        return np.array([float(value)])  # one step, the weights below would all be 0 and divide by 0
+    weights = np.linspace(0, 1, precision)
+    totals = np.cumsum(weights) / weights.sum() * value   # running total after each part
+    totals = np.round(totals)
+    return np.diff(totals, prepend=0)
 
-def execute_frames(ui: UInput, frame_data: dict, mouse_constant: int | float = 1.0, precision: int = 5):
-    # apply displacement
-    for code, value in frame_data["mouse"].items():
-        smooth_mouse_exec(ui, code, (value * mouse_constant), precision=precision)
-    # apply pressed keys
-    for code, value in frame_data["keys"].items():
+def write_keys(ui, keys):
+    for code, value in keys.items():
         ui.write(e.EV_KEY, int(code), int(value))
+    ui.syn()
+
+def write_mouse_smooth(ui, mouse, fps, precision=5):
+    xs = split_move(mouse.get(str(e.REL_X), 0), precision)
+    ys = split_move(mouse.get(str(e.REL_Y), 0), precision)
+    for i in range(precision):
+        ui.write(e.EV_REL, e.REL_X, int(xs[i]))
+        ui.write(e.EV_REL, e.REL_Y, int(ys[i]))
+        ui.syn()
+        time.sleep(0.9 / fps / precision) # 90% of a frame, so it's done before the next frame arrives
+
+# writes keys + mouse in its own thread, because the mouse smoothing sleeps and would slow the play loop
+class DeviceWriter:
+    def __init__(self, ui, fps, precision=5):
+        self.ui = ui
+        self.fps = fps
+        self.precision = precision
+        self.q = queue.Queue()
+        self.error = None  # set if the thread dies, write() raises it in the play loop
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        try:
+            while True:
+                frame_data = self.q.get()
+                if frame_data is None:     # stop signal
+                    break
+                write_keys(self.ui, frame_data["keys"])
+                mouse = {str(code): value for code, value in frame_data["mouse"].items()} # the model gives int keys, jsonl gives str
+                write_mouse_smooth(self.ui, mouse, self.fps, self.precision)
+        except Exception as error:
+            self.error = error
+
+    def write(self, frame_data):
+        # otherwise play keeps showing "Playing" while nothing reaches the game
+        if not self.thread.is_alive():
+            raise RuntimeError(f"Input writer stopped: {self.error}")
+        self.q.put(frame_data)
+
+    def stop(self):
+        self.q.put(None)
+        self.thread.join()

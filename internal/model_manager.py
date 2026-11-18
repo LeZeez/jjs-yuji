@@ -1,9 +1,9 @@
 
-import cv2
 import copy
 import timm
 import queue
 import threading
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ from typing import Literal, List
 from internal.config import ModelConfig, PlayConfig
 from torchvision.transforms import v2
 from internal.device_manager import KEYS, REL
+from internal.crosshair import draw_crosshair
 from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
 
 ModelMode = Literal["inference", "train"]
@@ -84,8 +85,6 @@ class Vision(nn.Module):
         self.vision = timm.create_model(
             'vit_small_patch16_dinov3.lvd1689m',
             pretrained=True,
-            features_only=True,
-            out_indices=(-1,)
         )
 
         data_config = timm.data.resolve_model_data_config(self.vision)
@@ -96,13 +95,28 @@ class Vision(nn.Module):
         v2.Normalize(mean=data_config["mean"], std=data_config["std"])
         ])
 
-    def forward(self, frame):
+    def forward(self, bgr_frames):
         device = next(self.vision.parameters()).device  # cuda but kept like that for flexibility for later (e.g. cpu mode)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = self.transform(frame).unsqueeze(0).to(device)
-        frame = self.vision(frame)[0].unsqueeze(0)
 
-        return frame
+        # bgr_frames: (N, H, W, 3)
+
+        # ===
+        # bgr_frames = np.array(bgr_frames) # copy, so the marker isn't drawn on the caller's frames
+        # bgr_frames = draw_crosshair(bgr_frames)
+        # crosshair currently commented but will be used for later checkpoints
+        # ===
+        
+        rgb_frames = bgr_frames[..., ::-1]
+        rgb_frames = np.ascontiguousarray(rgb_frames)
+
+        frames = torch.from_numpy(rgb_frames)
+        frames = frames.permute(0, 3, 1, 2) # (N, 3, H, W)
+        frames = frames.to(device)
+        frames = self.transform(frames)
+
+        features = self.vision.forward_intermediates(frames, indices=[-1], norm=False,
+                                                     output_fmt="NCHW", intermediates_only=True)[0]
+        return features  # (N, 384, 15, 27)
 
 @torch.no_grad()
 def get_controls(model_out, play_cfg: PlayConfig, model: JJSYuji):
@@ -149,13 +163,12 @@ def read_checkpoint(path):
 
 def load_model(path, mode: ModelMode = "train"):
     state_dict, sizes = read_checkpoint(path)
-    vision = Vision(sizes["vsn_width"], sizes["vsn_height"])
     model = JJSYuji(**sizes, mode=mode)
     model.register_buffer("x_bins", torch.zeros(sizes["num_bins_x"]))
     model.register_buffer("y_bins", torch.zeros(sizes["num_bins_y"]))
     model.register_buffer("key_thresh", torch.zeros(sizes["num_keys"]))
     model.load_state_dict(state_dict)
-    return model, vision, sizes
+    return model, sizes
 
 
 class ThreadModel:
@@ -180,7 +193,8 @@ class ThreadModel:
 
         try:
             # hardcoding eval/inference cuz not ideal for training anyway
-            model, vision, self.sizes = load_model(cfg.ckpt_path, mode="inference")
+            model, self.sizes = load_model(cfg.ckpt_path, mode="inference")
+            vision = Vision(self.sizes["vsn_width"], self.sizes["vsn_height"])
             model = model.to(device).eval()
             vision = vision.to(device).eval()
         except Exception as e:
@@ -201,7 +215,8 @@ class ThreadModel:
 
                 # forward pass
                 with torch.no_grad():
-                    vision_out = vision(frame)
+                    vision_out = vision(frame[None])     # (1, 384, 15, 27)
+                    vision_out = vision_out.unsqueeze(0) # (1, 1, 384, 15, 27), batch and time
                     model_out, states = model(vision_out, states)
 
                 controls = get_controls(model_out, play_cfg, model)

@@ -2,14 +2,16 @@ import torch
 import cv2
 import threading
 import json
+import time
 import internal.capture_manager as cm
 import internal.device_manager as dm
+import internal.sound_manager as sm
 from pynput import keyboard as kb
 from pathlib import Path
 import internal.config as c
 
 
-def record(cfg: c.Config, event: threading.Event, on_status = dm.notfy):
+def record(cfg: c.Config, event: threading.Event, on_status = sm.terminal_status):
     # I lagged so hard without these
     torch.set_num_threads(1)
     cv2.setNumThreads(1)
@@ -19,42 +21,81 @@ def record(cfg: c.Config, event: threading.Event, on_status = dm.notfy):
     mouse = dm.find_mouse(rec.strict_devices)[rec.mouse_idx or 0]
     keyboard = dm.find_keyboard(rec.strict_devices)[rec.keyboard_idx or 0]
     print(f"Mouse: {mouse.name} | Keyboard: {keyboard.name}")
-
+    
     out_pth = Path(rec.out_prefix).parent
     out_pth.mkdir(parents=True, exist_ok=True)
     frames_recorded = 0
 
-    # for files, next number after the highest rec_N (other files are ignored)
-    nums = [file.stem.split("_")[-1] for file in out_pth.iterdir()]
+    # for files, next number after the highest <prefix>_N (other files are ignored)
+    prefix = Path(rec.out_prefix).name + "_"  # "recorded/rec" -> "rec_"
+    nums = [file.stem.removeprefix(prefix) for file in out_pth.iterdir() if file.stem.startswith(prefix)]
     count = max([int(n) for n in nums if n.isdigit()] + [0]) + 1
     print("Starting with count", count)
 
-    fc = dm.FrameRecorder()
-    recorder = cm.DataRecorder(rec.cam_idx, rec.width, rec.height, rec.fps, f"{rec.out_prefix}_{count}.mkv")
-    on_status("Get ready. Recording in 5 seconds.")
-    if event.wait(5):
+    fc = dm.FrameRecorder(mouse, keyboard)
+    try:
+        recorder = cm.DataRecorder(rec.cam_idx, rec.width, rec.height, rec.fps, f"{rec.out_prefix}_{count}.mkv")
+    except Exception:
+        fc.stop()  # or the mouse/keyboard readers keep running after a failed start
+        raise
+
+    # the camera can ignore the requested fps, check it before recording
+    on_status("Checking camera FPS...")  # no sound, it only takes a second
+    seconds = recorder.measure_fps()
+    if abs(seconds - 1) > 0.05:
         recorder.release()
+        fc.stop()
+        raise RuntimeError(f"Camera runs at {rec.fps / seconds:.1f} fps, not {rec.fps}")
+
+    if event.is_set():
+        # stopped while checking the camera
+        recorder.release()
+        fc.stop()
         on_status("Stopped")
         return
-    on_status("Recording")
+
+    # a tick every second of the countdown
+    countdown = rec.countdown if rec.use_countdown else 0
+    for seconds_left in range(countdown, 0, -1):
+        on_status(f"Get ready. Recording in {seconds_left}...", sound="countdown")
+        if event.wait(1):
+            # if it stops mid-wait
+            recorder.release()
+            fc.stop()
+            on_status("Stopped")
+            return
+
+    on_status("Recording", sound="start")
 
     try:
         with recorder.open_file(), open(f"{rec.out_prefix}_{count}.jsonl", 'w') as f:
+            fc.get_frame_controls() # throw away the inputs from the countdown
+            failed = 0
+            start = time.monotonic()
             while True:
-                recorder.write()
-                frame_data = fc.get_frame_controls(mouse=mouse, keyboard=keyboard)
+                if not recorder.write():
+                    # no frame, no line, the inputs stay queued for the next frame
+                    failed += 1
+                    if failed >= 30:
+                        raise RuntimeError("Camera stopped returning frames")
+                    continue
+                failed = 0
+                elapsed = time.monotonic() - start
+                frame_data = fc.get_frame_controls()
+                frame_data["timestamp"] = round(elapsed, 4) # log timestamp
                 f.write(json.dumps(frame_data) + "\n")
                 frames_recorded += 1
                 if event.is_set() and frames_recorded % rec.nearest_stop == 0:
                     break
     finally:
         recorder.release()
-    on_status("Done!")
+        fc.stop()
+    on_status("Done!", sound="done")
 
 if __name__ == "__main__":
     event = threading.Event()
     # ctrl + alt + x to stop check and then stop recording when frames recorded % cfg.nearest_stop == 0
     listener =  kb.GlobalHotKeys(
-        {'<ctrl>+<alt>+x': lambda: dm.stop_notfy(event, dm.notfy)})
+        {'<ctrl>+<alt>+x': lambda: dm.request_stop(event, sm.terminal_status)})
     listener.start()
-    record(c.Config.load(), event, dm.notfy)
+    record(c.Config.load(), event, sm.terminal_status)
