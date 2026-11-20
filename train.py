@@ -14,7 +14,7 @@ import internal.model_manager as mm
 SAVE_PATH = "output_model.pt"
 
 SHIFTAMOUNT = 2
-NUM_KEYS = 15
+NUM_KEYS = 14 # must match KEYS in device_manager.py (E removed)
 NUM_BINS_X = 25 # upper limit, repeats in the quantiles can drop a few
 NUM_BINS_Y = 15 # ^^^
 VSN_WIDTH = 432 # must match the resize in prepare_data.py

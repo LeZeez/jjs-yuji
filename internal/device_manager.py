@@ -171,7 +171,7 @@ KEYS = [
     e.KEY_F,
     e.KEY_G,
     e.KEY_Q,
-    e.KEY_E,
+    # e.KEY_E,
     e.KEY_R,
     e.KEY_1,
     e.KEY_2,
