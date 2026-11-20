@@ -7,7 +7,6 @@ from pathlib import Path
 import os
 import subprocess
 import internal.model_manager as mm
-import internal.mu as mu
 
 
 # change as you like - these were my settings
@@ -16,36 +15,38 @@ SAVE_PATH = "output_model.pt"
 
 SHIFTAMOUNT = 2
 NUM_KEYS = 15
-NUM_BINS_X = 25
-NUM_BINS_Y = 15
-MU = 3 # use carefully
+NUM_BINS_X = 25 # upper limit, repeats in the quantiles can drop a few
+NUM_BINS_Y = 15 # ^^^
 VSN_WIDTH = 432 # must match the resize in prepare_data.py
 VSN_HEIGHT = 240 # ^^^
-BATCH  = 3584
-BATCH_SPLITS = 4 # splitting a video to n independent sequences for noise
-LR = 1e-4
-T_MAX = 4000
+HEAD_CHANNELS = 4 # channels the 384 DINO channels are squeezed to before flattening
+LYR_DIM = 256 # mLSTM width
+BATCH_SEQS = 16 # random windows per step, each from a random file
+SEQ_LEN = 896 # frames per window, must be a multiple of 128 (mLSTM chunk size)
+LR = 3e-4
+T_MAX = 2000
 PROPSPTH = "outputs_gen_props.pt" # calculates dataset props once so you don't have to redo it again
 DATASETPTH = "outputs_gen_int8/" # quantized dataset folder path containing .pt files
 USEMEM = True # can cause OOM if dataset is big (for reference, 1 hour of INT8 at 30fps is around 16gb)
 
 
-assert 0 < SHIFTAMOUNT < BATCH, "SHIFTAMOUNT must be greater than 0 and less than BATCH"
+assert 0 < SHIFTAMOUNT < SEQ_LEN, "SHIFTAMOUNT must be greater than 0 and less than SEQ_LEN"
+assert SEQ_LEN % 128 == 0, "SEQ_LEN must be a multiple of the mLSTM chunk size (128)"
 
 
 class JJSDataset(IterableDataset):
-    def __init__(self, folder_path: str | Path, in_memory: bool = True):
+    def __init__(self, folder_path: str | Path, num_seqs: int, seq_len: int, in_memory: bool = True):
         self.fldr_pth = Path(folder_path)
         self.files = [
             self.fldr_pth / file
             for file in os.listdir(self.fldr_pth)
         ]
+        self.num_seqs = num_seqs
+        self.seq_len = seq_len
         self.in_memory = in_memory
-        self.current_index = 0
         self.loaded_files = []
+        self.load_files() # mmap'd when not in memory, so random windows only read what they need
 
-        if self.in_memory:
-            self.load_files()
     def open_file(self):
         for file in self.files:
             print(file)
@@ -61,32 +62,44 @@ class JJSDataset(IterableDataset):
                 continue
 
     def load_files(self):
-        self.loaded_files = list(self.open_file())
+        # files too short for one window + shift are skipped
+        self.loaded_files = [
+            f for f in self.open_file()
+            if min(len(f["features_q"]), len(f["keys"]), len(f["mouse"])) >= self.seq_len + SHIFTAMOUNT
+        ]
+
+    def random_window(self):
+        f = self.loaded_files[np.random.randint(len(self.loaded_files))]
+        n = min(len(f["features_q"]), len(f["keys"]), len(f["mouse"]))
+        a = np.random.randint(0, n - self.seq_len - SHIFTAMOUNT + 1)
+        t = slice(a + SHIFTAMOUNT, a + SHIFTAMOUNT + self.seq_len) # targets are SHIFTAMOUNT frames ahead
+        return f["features_q"][a:a + self.seq_len], f["features_scale"][a:a + self.seq_len], f["keys"][t], f["mouse"][t]
 
     def __iter__(self):
         while True:
-            source = (
-                self.loaded_files
-                if self.in_memory
-                else self.open_file()
-            )
+            windows = [self.random_window() for _ in range(self.num_seqs)]
+            # features (B, T, 384, H, W) int8, scale (B, T, 384), keys (B, T, keys), mouse (B, T, 2)
+            yield tuple(torch.stack(x) for x in zip(*windows))
 
-            for i, loaded in enumerate(source):
-                self.current_index = i
-                yield (
-                    # # uncomment if you use raw features (not recommended)
-                    # loaded["features"],
+# quantile bins instead of mu-law
+def get_bins(num_bins, values):
+    split = (num_bins - 1) // 2                      # bins per side
+    values = values.float()
+    q = torch.linspace(0, 1, split + 1)[1:-1]        # split - 1 cuts per side
 
-                    # == for quantized features ==
-                    loaded["features_q"],
-                    loaded["features_scale"],
-                    # ============================
-                    loaded["keys"],
-                    loaded["mouse"],
-                )
+    # borders sit at .5 so a whole-number move never lands on one
+    pos = torch.quantile(values[values > 0], q).round() + 0.5
+    neg = torch.quantile(-values[values < 0], q).round() + 0.5
+    pos = pos[pos > 0.5].unique()                    # drop repeats and copies of the zero border
+    neg = neg[neg > 0.5].unique()
+
+    edges = torch.cat([-neg.flip(0), torch.tensor([-0.5, 0.5]), pos])
+    ix = torch.bucketize(values, edges)
+    bins = torch.stack([values[ix == i].median() for i in range(len(edges) + 1)])  # value played per bin
+    return edges, bins
 
 
-dataset = JJSDataset(DATASETPTH, USEMEM)
+dataset = JJSDataset(DATASETPTH, BATCH_SEQS, SEQ_LEN, USEMEM)
 dataloader = DataLoader(dataset=dataset, batch_size=None, num_workers=0)
 
 n = 0
@@ -97,12 +110,12 @@ m_y_all = []
 if not Path(PROPSPTH).exists():
     for f in dataset.files:
         f = torch.load(f, map_location="cpu", mmap=True)
-        k = f["keys"][:BATCH][:-SHIFTAMOUNT].clone()
+        k = f["keys"][:-SHIFTAMOUNT].clone()
         is_0 = (k == 0).float().sum(0)
         is_1 = (k == 1).float().sum(0)
         k_counts_per_key += torch.stack([is_0, is_1], dim=1)
 
-        m = f["mouse"][:BATCH][:-SHIFTAMOUNT].clone()
+        m = f["mouse"][:-SHIFTAMOUNT].clone()
         m_x = m[..., 0].reshape(-1)
         m_y = m[..., 1].reshape(-1)
 
@@ -122,59 +135,35 @@ elif Path(PROPSPTH).exists():
     m_x_all = props["m_x_all"]
     m_y_all = props["m_y_all"]
 
-m_x_all = torch.stack(m_x_all).reshape(-1)
-m_y_all = torch.stack(m_y_all).reshape(-1)
-m_x_all_abs = torch.abs(m_x_all)
-m_y_all_abs = torch.abs(m_y_all)
+m_x_all = torch.cat(m_x_all)
+m_y_all = torch.cat(m_y_all)
+x_edges, x_bins = get_bins(NUM_BINS_X, m_x_all)
+y_edges, y_bins = get_bins(NUM_BINS_Y, m_y_all)
+NUM_BINS_X, NUM_BINS_Y = len(x_bins), len(y_bins) # repeats can drop a bin, the model must match
 
-scale_x = torch.quantile(m_x_all_abs.float(), 0.99)
-scale_y = torch.quantile(m_y_all_abs.float(), 0.99)
-camera_maxval_x = scale_x.item()
-camera_maxval_y = scale_y.item()
-camera_binsize_x = (2 * camera_maxval_x) / (NUM_BINS_X - 1)
-camera_binsize_y = (2 * camera_maxval_y) / (NUM_BINS_Y - 1)
-
+# sqrt so rare keys are pushed up, but not as hard as the full ratio
 key_pos_weight = k_counts_per_key[:, 0] / k_counts_per_key[:, 1]
-key_pos_weight = key_pos_weight.masked_fill(k_counts_per_key[:, 1] == 0, 1e-4)
-
-
-
-qx = mu.CameraQuantizer(camera_maxval=camera_maxval_x, camera_binsize=camera_binsize_x,
-                     quantization_scheme="mu_law", mu=MU)
-qy = mu.CameraQuantizer(camera_maxval=camera_maxval_y, camera_binsize=camera_binsize_y,
-                     quantization_scheme="mu_law", mu=MU)
-
-x_bins = torch.tensor(qx.undiscretize(np.arange(NUM_BINS_X)))
-x_bins = torch.round(x_bins)
-y_bins = torch.tensor(qy.undiscretize(np.arange(NUM_BINS_Y)))
-y_bins = torch.round(y_bins)
-
-x_weight = mu.val_to_ix(m_x_all, x_bins).bincount(minlength=NUM_BINS_X).clamp(min=1)
-x_weight = (x_weight.sum() / (x_weight * NUM_BINS_X))
-
-y_weight = mu.val_to_ix(m_y_all, y_bins).bincount(minlength=NUM_BINS_Y).clamp(min=1)
-y_weight = (y_weight.sum() / (y_weight * NUM_BINS_Y))
-
+key_pos_weight = key_pos_weight.masked_fill(k_counts_per_key[:, 1] == 0, 1e-4).sqrt()
 
 key_loss_fn = nn.BCEWithLogitsLoss(pos_weight=key_pos_weight.cuda())
-dx_loss_fn = nn.CrossEntropyLoss(weight=x_weight.cuda())
-dy_loss_fn = nn.CrossEntropyLoss(weight=y_weight.cuda())
+dx_loss_fn = nn.CrossEntropyLoss() # plain, the quantile bins are already balanced
+dy_loss_fn = nn.CrossEntropyLoss()
 
 
 sizes = {"num_keys": NUM_KEYS, "num_bins_x": NUM_BINS_X, "num_bins_y": NUM_BINS_Y,
-         "vsn_width": VSN_WIDTH, "vsn_height": VSN_HEIGHT}
+         "vsn_width": VSN_WIDTH, "vsn_height": VSN_HEIGHT,
+         "head_channels": HEAD_CHANNELS, "lyr_dim": LYR_DIM}
 model = mm.JJSYuji(**sizes, mode="train")
 
+model.register_buffer("x_edges", x_edges)
+model.register_buffer("y_edges", y_edges)
 model.register_buffer("x_bins", x_bins)
 model.register_buffer("y_bins", y_bins)
 model.register_buffer("key_thresh", key_pos_weight / (1 + key_pos_weight))
 model = model.to("cuda")
 
 torch.set_printoptions(sci_mode=False)
-print("x_s:", scale_x)
-print("y_s:",scale_y)
-print("x_w:", x_weight)
-print("y_w:",y_weight)
+print("params:", sum(p.numel() for p in model.parameters()))
 print("pos:", key_pos_weight)
 print("x_bins:", model.x_bins)
 print("y_bins:", model.y_bins)
@@ -183,70 +172,33 @@ optimizer = optim.AdamW(model.parameters(), fused=True, lr=LR)
 updates = 0
 
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, 
-    T_max=T_MAX, 
+    optimizer,
+    T_max=T_MAX,
     eta_min=(LR / 10)
 )
 
-seq_len = BATCH // BATCH_SPLITS
-
-mouse_size = [BATCH_SPLITS * seq_len, NUM_BINS_X + NUM_BINS_Y]
-key_size = [BATCH_SPLITS, seq_len, NUM_KEYS]
-features_size = [BATCH_SPLITS, seq_len, 384, VSN_HEIGHT // 16, VSN_WIDTH // 16]
-
-loss_mask = torch.ones(BATCH, dtype=torch.bool, device="cuda")
-loss_mask[-SHIFTAMOUNT:] = False
-
-loss_mask_key = loss_mask.reshape(BATCH_SPLITS, seq_len)
-loss_mask_mouse = loss_mask.clone()
-
-
 for i, batch in enumerate(dataloader):
     features, scale, target_keys, target_mouse = batch
-    # discard extra feats if exist
-    if min(len(features), len(target_keys), len(target_mouse)) < BATCH:
-        print(
-            f"Too short: features={len(features)}, "
-            f"keys={len(target_keys)}, mouse={len(target_mouse)}"
-        )
-        continue
 
-    features = features[:BATCH].cuda()
-    scale = scale[:BATCH].cuda()
-    scale = scale.unsqueeze(-1).unsqueeze(-1) # (BATCH, 384, 1, 1), a scale per frame and channel
-    target_keys = target_keys[:BATCH]
-    target_mouse = target_mouse[:BATCH]
+    # dequantize, each frame with its own scale
+    features = features.cuda().float() * scale.cuda().float().view(BATCH_SEQS, SEQ_LEN, 384, 1, 1)
 
-    # apply shift
-    if SHIFTAMOUNT > 0:
-        target_keys = torch.roll(target_keys, -SHIFTAMOUNT, dims=0)
-        target_mouse = torch.roll(target_mouse, -SHIFTAMOUNT, dims=0)
-
-        target_keys[-SHIFTAMOUNT:] = 0
-        target_mouse[-SHIFTAMOUNT:] = 0
-
-    features = (features.float() * scale).reshape(features_size) # dequantize
-
-    target_keys = target_keys.reshape(key_size).float().cuda()
+    target_keys = target_keys.float().cuda()
     target_mouse = target_mouse.float().cuda()
-    target_x = target_mouse[..., 0]
-    target_y = target_mouse[..., 1]
-
-    target_x = mu.val_to_ix(target_x, model.x_bins)
-    target_y = mu.val_to_ix(target_y, model.y_bins)
+    target_x = torch.bucketize(target_mouse[..., 0].reshape(-1).contiguous(), model.x_edges)
+    target_y = torch.bucketize(target_mouse[..., 1].reshape(-1).contiguous(), model.y_edges)
 
     # calc loss
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         (key_preds, mouse_preds), _ = model(features)
-        key_preds = key_preds.view(key_size)
 
-        loss_keys = key_loss_fn(key_preds[loss_mask_key], target_keys[loss_mask_key])
+        loss_keys = key_loss_fn(key_preds, target_keys)
 
-        mouse_preds = mouse_preds.reshape(mouse_size)
+        mouse_preds = mouse_preds.reshape(-1, NUM_BINS_X + NUM_BINS_Y)
         preds_x = mouse_preds[:, :NUM_BINS_X]
         preds_y = mouse_preds[:, NUM_BINS_X:]
-        loss_x = dx_loss_fn(preds_x[loss_mask_mouse], target_x[loss_mask_mouse])
-        loss_y = dy_loss_fn(preds_y[loss_mask_mouse], target_y[loss_mask_mouse])
+        loss_x = dx_loss_fn(preds_x, target_x)
+        loss_y = dy_loss_fn(preds_y, target_y)
     total_loss = loss_keys + loss_x + loss_y
     if (updates % 10 == 0) or (updates == 0):
         loss = total_loss.item()

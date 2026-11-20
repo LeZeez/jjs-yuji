@@ -8,13 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.types import Device
-from math import floor
 from numpy.typing import NDArray
 from typing import Literal, List
 from internal.config import ModelConfig, PlayConfig
 from torchvision.transforms import v2
 from internal.device_manager import KEYS, REL
-from internal.crosshair import draw_crosshair
+from internal.frame_editor import draw_crosshair, mask_candy
 from xlstm.xlstm_large.model import xLSTMLargeConfig, mLSTMBlock, mLSTMLayerStateType
 
 ModelMode = Literal["inference", "train"]
@@ -24,45 +23,48 @@ StateType = List[mLSTMLayerStateType] | None
 class JJSYuji(nn.Module):
     def __init__(self, num_keys: int, num_bins_x: int,
                  num_bins_y: int, vsn_width: int = 432, vsn_height: int = 240,
+                 head_channels: int = 4, lyr_dim: int = 256, dropout: float = 0.1,
                  mode: ModelMode = "train"):
         super().__init__()
         self.num_bins_x = num_bins_x
         self.num_bins_y = num_bins_y
-        self.conv = nn.Conv2d(384, 64, 1)
-        self.dropout2d = nn.Dropout2d(p=0.2)
-        self.convstr = nn.Conv2d(64, 64, 3, 2, 1)
+        self.lyr_dim = lyr_dim
         # DINO's feature map is vsn size / 16 (patch size), e.g. 240x432 -> 15x27
-        h = floor((vsn_height // 16 + 2*1 - 3) / 2) + 1
-        w = floor((vsn_width // 16 + 2*1 - 3) / 2) + 1
-        self.img_dim = self.convstr.out_channels * h * w
-        self.down_proj = nn.Linear(self.img_dim, 1024)
+        h = vsn_height // 16
+        w = vsn_width // 16
+        # flatten head: squeeze channels, mix neighbours, keep every position (the layout is what aims)
+        self.conv = nn.Sequential(
+            nn.Conv2d(384, head_channels, 1),
+            nn.GELU(),
+            nn.Conv2d(head_channels, head_channels, 3, padding=1)
+        )
         self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(p=0.2)
+        self.down_proj = nn.Linear(head_channels * h * w, lyr_dim)
+        self.dropout = nn.Dropout(p=dropout)
+
 
         kernel = "native_autograd" if mode == "inference" else "triton_xl_chunk"
         chunk_size = 1 if mode == "inference" else 128
         self.cfg = xLSTMLargeConfig(
-            1024, 4, 1, 0, 
+            self.lyr_dim, 4, 1, 0,
             chunk_size=chunk_size,
             chunkwise_kernel=f"chunkwise--{kernel}",
             return_last_states=True
         )
         self.main_layers = nn.ModuleList([mLSTMBlock(self.cfg) for _ in range(2)])
-        self.last_norm = nn.LayerNorm(1024)
-        self.key_layer = nn.Linear(1024, num_keys)
-        self.mouse_layer = nn.Linear(1024, num_bins_x + num_bins_y)
+        self.last_norm = nn.LayerNorm(self.lyr_dim)
+        self.key_layer = nn.Linear(self.lyr_dim, num_keys)
+        self.mouse_layer = nn.Linear(self.lyr_dim, num_bins_x + num_bins_y)
 
     def forward(self, x: torch.Tensor, states: StateType = None):
         B, T, C, H, W = x.shape
 
         x = x.reshape([B * T, C, H, W])
         x = self.conv(x)
-        x = self.dropout2d(x)
-        x = self.convstr(x)
-        x = x.reshape([B, T, self.img_dim])
+        x = x.reshape([B, T, -1])
         x = self.gelu(x)
-        x = self.dropout(x)
         x = self.down_proj(x)
+        x = self.dropout(x)
 
         if states is None:
             states = [None] * len(self.main_layers)
@@ -99,13 +101,9 @@ class Vision(nn.Module):
         device = next(self.vision.parameters()).device  # cuda but kept like that for flexibility for later (e.g. cpu mode)
 
         # bgr_frames: (N, H, W, 3)
-
-        # ===
-        # bgr_frames = np.array(bgr_frames) # copy, so the marker isn't drawn on the caller's frames
-        # bgr_frames = draw_crosshair(bgr_frames)
-        # crosshair currently commented but will be used for later checkpoints
-        # ===
-        
+        bgr_frames = np.array(bgr_frames) # copy, so the marker isn't drawn on the caller's frames
+        bgr_frames = draw_crosshair(bgr_frames)
+        bgr_frames = mask_candy(bgr_frames)
         rgb_frames = bgr_frames[..., ::-1]
         rgb_frames = np.ascontiguousarray(rgb_frames)
 
@@ -114,7 +112,7 @@ class Vision(nn.Module):
         frames = frames.to(device)
         frames = self.transform(frames)
 
-        features = self.vision.forward_intermediates(frames, indices=[-1], norm=False,
+        features = self.vision.forward_intermediates(frames, indices=[-1], norm=True,
                                                      output_fmt="NCHW", intermediates_only=True)[0]
         return features  # (N, 384, 15, 27)
 
@@ -130,19 +128,45 @@ def get_controls(model_out, play_cfg: PlayConfig, model: JJSYuji):
     preds_x = mouse_preds[..., :model.num_bins_x] / play_cfg.mouse_temp
     preds_y = mouse_preds[..., model.num_bins_x:] / play_cfg.mouse_temp
 
-    preds_x = preds_x.argmax(-1)
-    preds_y = preds_y.argmax(-1)
-
-    preds_x = model.x_bins[preds_x]
-    preds_y = model.y_bins[preds_y]
+    # weighted average of the top bin and its two neighbours
+    preds_x = soft_decode(preds_x, model.x_bins, 1)
+    preds_y = soft_decode(preds_y, model.y_bins, 1)
 
 
     key_dct = {k: v for k, v in zip(KEYS, mem_keys)}
 
-    exec_mouse = [preds_x.item(), preds_y.item()]
+    exec_mouse = [float(preds_x), float(preds_y)]
     mouse_dct = {k: v for k, v in zip(REL, exec_mouse)}
     return {"keys": key_dct, "mouse": mouse_dct}
 
+def get_window(x: torch.Tensor, index: int, radius: int) -> torch.Tensor:
+    n = x.size(0)
+    window_len = 2 * radius + 1
+    
+    if window_len > n:
+        raise ValueError(f"Window length ({window_len}) cannot exceed tensor size ({n}).")
+    
+    
+    start = index - radius
+    
+    # clamp bounds so window stays size (2 * radius + 1)
+    if start < 0:
+        start = 0
+    elif start + window_len > n:
+        start = n - window_len
+
+    return x[start : start + window_len], torch.arange(start, start + window_len)
+
+def soft_decode(logits, bins, radius):
+    probs = F.softmax(logits, -1)
+    argidx = probs.argmax(-1)
+
+    if bins[argidx] == 0:
+        return 0
+    
+    window, indices = get_window(probs, argidx, radius)
+    values = (bins[indices] * window).sum() / window.sum()
+    return values
     
 def read_checkpoint(path):
     # returns the weights and the sizes the model was trained with
@@ -166,6 +190,8 @@ def load_model(path, mode: ModelMode = "train"):
     model = JJSYuji(**sizes, mode=mode)
     model.register_buffer("x_bins", torch.zeros(sizes["num_bins_x"]))
     model.register_buffer("y_bins", torch.zeros(sizes["num_bins_y"]))
+    model.register_buffer("x_edges", torch.zeros(sizes["num_bins_x"] - 1))
+    model.register_buffer("y_edges", torch.zeros(sizes["num_bins_y"] - 1))
     model.register_buffer("key_thresh", torch.zeros(sizes["num_keys"]))
     model.load_state_dict(state_dict)
     return model, sizes
