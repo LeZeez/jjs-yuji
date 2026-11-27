@@ -20,7 +20,7 @@ class RecordConfig(CaptureConfig):
     strict_devices: bool = True       # hide extra interfaces (e.g. a mouse's macro keyboard)
                                       # turn off for laptops / combo devices
     out_prefix: str = "recorded/rec"  # folder + file prefix, the number is added automatically (e.g., recorded/rec_1)
-    nearest_stop: int = 3584          # recording stops when frames are divisible by this (divisible by 128 for mLSTM kernel)
+    nearest_stop: int = 1          # recording stops when frames are divisible by this
     use_countdown: bool = True
     countdown: int = 3                # seconds before recording starts
 
@@ -28,8 +28,7 @@ class RecordConfig(CaptureConfig):
 @dataclass
 class PlayConfig(CaptureConfig):
     mouse_temp: float = 1.0
-    kbrd_thresh_soften: float = 0.2   # the more it is the more the model is eager to press all buttons
-                                      # (1.0 makes it press everything all at once)
+    kbrd_thresh_soften: float = 0.1   # lowers the threshold of W A S D, the more it is the more eagerly they're pressed
     mouse_precision: int = 5          # each frame's mouse move is split into this many steps over the frame
                                       # (read when play starts, not every frame)
     use_countdown: bool = True
@@ -38,7 +37,7 @@ class PlayConfig(CaptureConfig):
 # sizes (keys, mouse bins, vision) are read from the checkpoint
 @dataclass
 class ModelConfig:
-    ckpt_path: str = "model.pt"
+    ckpt_path: str = "jjs-yuji-2.pt"
 
 @dataclass
 class Config:

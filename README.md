@@ -8,17 +8,14 @@
 
 > **Disclaimer:** This repository is for educational and research purposes only. Using bots or automation in Roblox may violate the [Roblox Terms of Use](https://en.help.roblox.com/hc/en-us/articles/115004647846) and can get your account banned. I am not responsible for any consequences of using this code, including account bans or any other damages. Use it at your own risk.
 
-**Built with technology from NXAI.** See [Licensing](#licensing).
-
 ## Contents
 - [Requirements](#requirements)
 - [Usage](#usage)
 - [Architecture](#architecture)
 - [Model state](#model-state)
-- [Examples](#examples)
 - [Limitations](#limitations)
 - [Technical report](#technical-report)
-- [Note](#note)
+- [AI usage](#ai-usage)
 - [Licensing](#licensing)
 
 ## Requirements
@@ -48,66 +45,38 @@ Run `python gui.py`. Each tab (**Record**, **Play**, **Model**) has its own sett
 If your mouse or keyboard doesn't show up (e.g. on a laptop or with a keyboard+touchpad combo), untick **Strict device filter** in the Record tab.
 
 ### Run the pretrained model
-1. Download [`model.pt`](https://huggingface.co/TheZeez/jjs-yuji/blob/main/model.pt) into the repo root.
+1. Download [`jjs-yuji-2.pt`](https://huggingface.co/TheZeez/jjs-yuji-2/blob/main/jjs-yuji-2.pt) into the repo root.
 2. In the **Play** tab, set the camera to your capture device (OBS virtual camera or whatever is capturing Roblox).
 3. Press **Start** or `Ctrl+Alt+Z` (it loads the model first if it isn't loaded). Press `Ctrl+Alt+X` to stop.
 
 Or run `python inference.py` without the GUI.
 
 ### Train your own
-Run these in order. Recording settings come from `config.json`, the other folder names are hard-coded at the top of each script.
-1. **Record** tab (or `recorder.py`): records video + inputs at 30fps to `recorded/` (`Ctrl+Alt+Z` to start from the GUI, `Ctrl+Alt+X` to stop)
-2. `prepare_data.py`: extracts DINOv3 features from `IN_PATHS` into `outputs_gen_int8/` (at the end, `VAL_COUNT` random new files are moved to `outputs_gen_int8_val/` for validation)
-3. `train.py`: trains and saves `output_model.pt` (set the checkpoint to it in the **Model** tab to use it)
+Record data using the recorder in GUI, `python prepare_data.py` to convert your data to int8 `.pt` files, and `python train.py` to train + `python validate.py` to validate your training. Make sure to edit constants in the files (decoupled from config intentionally).
 
 ## Architecture
 | | |
 |---|---|
-| **Control** | `evdev`: input recording with `InputDevice.read()` and execution with `UInput` |
-| **Vision** | `timm`, DINOv3 S (`vit_small_patch16_dinov3.lvd1689m`) |
-| **Model** | two bare mLSTM layers (1024 -> 1024) from xLSTMLarge ([original repo](https://github.com/NX-AI/xlstm)) |
-| **Resolution** | 432x240 |
+| **Control** | `evdev`: input recording with `InputDevice.read()` in threads and execution with `UInput` (mouse moves spread over the frame) |
+| **Vision** | `timm`, DINOv3 S (`vit_small_patch16_dinov3.lvd1689m`), frozen, features stored as `int8` |
+| **Resolution** | 432x240 at 30 fps (DINO map: 384 x 15 x 27) |
+| **Model** | ConvLSTM2D (256 filters) -> 1x1 conv to 4 channels -> flatten -> Linear 512 -> x + SwiGLU(norm x) -> norm -> key and mouse heads (8.7M params) |
 
 ## Model state
-The model is decent. It's unpurposed, so it does everything only if you start it (e.g., you start a combo, it continues it). However, since it was trained on only 3 hours, it does only things it's confident in, which is mostly parkour and navigation. It can also be so random. I ended here because I don't have time for data recording because I'm in uni :')
-
-## Examples
-### Combat
-*it mostly was getting cooked tbh*
-
-![](assets/combat_1.gif)
-
-![](assets/combat_2.gif)
-
-### Parkour and navigation
-*it's decent in this*
-
-![](assets/parkour_1.gif)
-
-![](assets/parkour_2.gif)
+The model is now a lot better than previous release. It has a clear purpose (to win 1v1) and it has more data (9h vs previous 3h).
 
 ## Limitations
-Since it was trained on only 3 hours of unpurposed data, we can't expect it to generalize very well or to correct itself in all situations. Also, it was only trained using the character *Vessel*.
-
-*freezing*
-
-![](assets/freeze.gif)
-
-*nudging unfreezes it*
-
-![](assets/freeze_nudge.gif)
+With 9 hours of data, it's basically a newborn. When facing real players with even a single brain cell, expect it to choke a lot. It sometimes mistakes spawn blocks or literally nothing for players and starts beefing with air (figh club). The project's purpose isn't a good model but learning how to make one, and the only ceiling now is the amount of data. Also, the model was only trained using the character *Vessel*, which is Itadori Yuji.
 
 ## Technical report
 The full experiment log is in [REPORT.md](REPORT.md).
 
-## Note
-AI was used only for GUI, boilerplate, and debugging.
+## AI usage
+AI was used for making ConvLSTM class, test scripts, GUI, boilerplate, and debugging.
 
 ## Licensing
 This project uses third-party code and models with their own licenses:
 
-- **xLSTM** ([NX-AI/xlstm](https://github.com/NX-AI/xlstm)): the `xlstm` package is Apache-2.0. Its kernels come from `mlstm_kernels`, which is under the **NXAI Community License** ([NXAI_LICENSE](NXAI_LICENSE)). Built with technology from NXAI.
-- **OpenAI Video-Pre-Training** ([openai/Video-Pre-Training](https://github.com/openai/Video-Pre-Training)): the mu-law `CameraQuantizer` in `internal/mu.py` is adapted from it under the MIT License.
 - **DINOv3** (`vit_small_patch16_dinov3.lvd1689m` via `timm`): weights are downloaded at runtime and are under the [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license) by Meta. They are not included in this repo.
 
 See [NOTICE](NOTICE) for the full attribution notices.

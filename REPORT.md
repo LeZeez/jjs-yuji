@@ -120,3 +120,107 @@ I learned about AvgPool2d and how to properly use `timm`. I learned about `torch
 - Hit-or-miss combos (when I start it, it can do great combos, though it's still not consistent because of data scarcity)
 - Sometimes freezes in place and struggles with mouse, but overall it's a really decent model for only 3 hours
 - 40 bins was worse than 25
+
+# Second release report
+I had gotten some free time and recorded 4 hours of data, totalling 7 hours then. I kept trying new architectures to remove the down projection layer. I wanted something to generalize on all parts of the screen instead of learning something here and not there. I failed miserably. I tried attention pooling, ViL (vision LSTM), nothing worked. I had to pay the parameter tax from flattening anyway. I found a lot of bugs in the repo that made most of the 7 hours unusable.
+
+**Findings:**
+- What the model was trained on (compressed mess) wasn't what it saw. Same picture processed through training pipeline wasn't the same in play's, and both produced completely different outputs from the model.
+- Found a huge recorder bug: one read only got up to 64 mouse events per frame while my mouse sends up to ~100, so fast turns were under-recorded (8% overall, 22% on fast frames) and ~10% of M1 presses were lost (recorded as release only).
+- The model was still unpurposed and I couldn't purpose it on the public game, especially after the game map changed (thanks tze).
+
+
+## Actions and results
+
+### Recorder
+- Fixed recorder with a threaded reader. But the old 7h couldn't be repaired ):
+- Made sure that what the model saw was consistent in training and play picture (lossless data)
+
+### Gameplay & data
+- Switched to 1v1 (Duels). One purpose, smaller map, less data needed. 
+- Recorded 9 hours using the fixed recorder (hell). 
+- Enabled the new damage counter and it was the best addition to the new update so the model actually knows it hit the opponent.
+- Masked the candy counter in the corner so the model can't use it as a clock and so the model remains playable after the event (data was recorded in halloween event).
+- Added high contrast crosshair so the model has an anchor to help aim
+
+### Aim tests
+- Added an aim test: on recordings the model never saw, how often it turns the same way as me, how often the opposite way, the correlation of 8-frame turns (`c8`, about 0.27 s = what reads as aiming), and how far it turns on my big turns (`turn`).
+
+For mouse x axis:
+- The first release scored 62% same, 26% opposite, 12% still, and `c8` 0.41
+- This release scored around 62% same, 10% opposite, 30% still, and `c8` 0.59. Aim is significantly better in live play too.
+
+### New head
+- Attention pooling vs flattening the DINO map: flattening aims 2 to 2.5x better (every screen position keeps its own weights but learns independently however).
+- Squeezed the map to just 4 channels per position before flattening: as good as 16, 32 or 64, but 2 was too few.
+- Quantile bins with linear space vs mu-law: tied, so quantile because it's simpler.
+- Random windows from all files with bigger batches instead of fixed chunks on the same video yielded real gain.
+- Removed key E (unused in the 1v1).
+
+
+**Result:** better on paper, about the same in game. Still froze, still blocked forever (what I called F-lock).
+
+### Action chunking (dropped)
+- Instead of only the next frame, the model predicts the keys of the next 8 frames and play runs 4 of them before asking again
+- Tested keys only, keys + mouse, and a CVAE version.
+
+**Result:**
+- Keys only: tied offline, shorter F-locks (not none), and a bit better live.
+- Chunking the mouse hurt aim (a few frames ahead is close to unpredictable from the screen).
+- The CVAE either barely pressed anything or spammed.
+- Dropped because it made the code complex over small gain.
+
+## ConvLSTM phase
+Inspired by the Counter-Strike Deathmatch with Large-Scale Behavioural Cloning paper (Pearce & Zhu), which uses a ConvLSTM, I decided to try it along with a few more things from their project.
+
+### Architecture and window length tests
+- Replaced mLSTM with a plain LSTM in the same blocks. They tied, and the LSTM was simpler so dropped mLSTM.
+- I used a near-replica of the ConvLSTM Keras class (made by AI ofc because lazy) and it was the best one yet in aim and keyboard.
+- Tried different sizes: ConvLSTM filters (from 4 to 384), down_proj (256, 512)
+- Added SwiGLU and it improved performance and capacity because ConvLSTM alone had little capacity.
+- Final layout: DINO map -> ConvLSTM (256 filters) -> 1x1 conv to 4 channels -> flatten -> Linear to 512 -> x + SwiGLU(norm x) -> norm -> key and mouse heads.
+- 6 s windows (180 frames, like CSGO's 96 frames at 16 fps) instead of 30 s.
+
+**Result:** very good model. It got a bunch of kills on its own I stood up and applauded. 256 and 384 filters were close, 384 a little better on paper but a lot less efficient to train.
+
+### Weights
+- I added mouse bin weights since quantile bin occurrences wasn't really uniform across all bins
+- Capped the key `pos_weight` at 50 (rare keys like G and R were at 100-200).
+
+**Result:**
+- Full uncapped weights: the mouse never stops moving (it stands still on 5% of frames, I do on 42%), jittery.
+- Sqrt: calmer and best gameplay at the time. It stops at the right times (mostly)
+
+### Outcome sampling
+I labeled the dataset using simple algorithm that checks: damage counter on (combat), HP decreasing (humbled), neither (idle). The labels then are used from the dataset sampler with ratios: 1.0 idle, 2.0 for combat, and 0.5 for humbled.
+
+The ratios mean that combat appears 2x more often than idle, and humbled appears 2x less than idle in the dataset sampler.
+
+I used combat ratio 2.0 and 3.0
+
+**Result:**
+- **Combat 2.0 is the sweet spot.** Used for the latest model. It learned combos, takes openings, and its F-lock looks like a tactic (waiting for the enemy to hit) instead of a curse like other experiments and 3.0 ratio.
+- Combat 3.0 and everything trained on it: F-lock got worse, it stays blocking even when there's an opening (this is in 2.0 but it was worse in 3.0). Too few calm moments to learn when to let go.
+
+
+### Things that didn't work
+- **Bot self-play data:** let the model play for 2.5 h and kept its combat parts. 7 out of 10 samples I checked were trash (was on another model though, but the idea was still not that good anyway)
+- **Exponential tail bins** (more bins for big flicks): bigger turns, but less accurate vertical aim and no better live.
+- **Squeeze to 16 channels instead of 4:** overfit and more parameters.
+
+## Final phase
+
+### Corrections and manual labeling
+- MANUALLY labeled 1204 clips of combat to reduce F-lock and parts I did stupid moves in (hell). Now we have a "rejected" category. I made its ratio 0.5 like "humbled".
+- A script where the model plays and I take over with a mouse side button whenever it messes up, then hand back. Every frame is recorded with who was playing.
+- Recorded 34 minutes, 30 of them me playing from the situations the model got itself into.
+- Fine-tuned the base model on it: each step half old data (with the manual review ratios), half corrections, and the loss only counts the frames I played.
+
+**Result:** a lot better. It learned exactly the moments where it used to go wrong.
+
+### Executing controls
+- Tried thresholds set so the model presses each key as often as I do: not great.
+- Then did what the CSGO paper does: movement keys (W A S D) are pressed when their real chance is over 50%, and the other keys (F, Q, M1, Space, skills, ult) are rolled with their real chance every frame.
+- "F" itself was in the held category first because it's a hold button, but when it's rolled, F-lock was almost non-existent and made the model finally not depend on it, but now it has to perfectly time blocking.
+
+**Result:** current model.

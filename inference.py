@@ -26,7 +26,7 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
 
         # == INFERENCE ==
         states = None
-        with dm.init_input_device("TEST") as ui:
+        with dm.init_input_device("JJSYUJI") as ui:
             writer = dm.DeviceWriter(ui, cap.fps, cap.mouse_precision)
             try:
                 failed = 0
@@ -40,6 +40,8 @@ def play(cfg: c.Config, model: mm.ThreadModel, event: threading.Event, on_status
                         continue
                     failed = 0
                     frame_data, states = model.generate(frame, states, cfg.play)
+                    if mm.random_reset():
+                        states = None # the next frame starts with a fresh memory
                     writer.write(frame_data)
             finally:
                 writer.stop()
