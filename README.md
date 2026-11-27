@@ -4,9 +4,11 @@
 
 <p align="center">An AI model that plays JJS (Jujutsu Shenanigans) using imitation learning (behavioral cloning).</p>
 
-<!-- DEMO VIDEO PLACEHOLDER -->
 
-> **Disclaimer:** This repository is for educational and research purposes only. Using bots or automation in Roblox may violate the [Roblox Terms of Use](https://en.help.roblox.com/hc/en-us/articles/115004647846) and can get your account banned. I am not responsible for any consequences of using this code, including account bans or any other damages. Use it at your own risk.
+https://github.com/user-attachments/assets/5384607e-0359-4805-9815-eb08b6f61deb
+
+
+> **Disclaimer:** This repository is for educational and research purposes only. Using bots or automation in Roblox may violate the [Roblox Terms of Use](https://en.help.roblox.com/hc/en-us/articles/115004647846) and can get your account banned. Use it at your own risk.
 
 ## Contents
 - [Requirements](#requirements)
@@ -22,6 +24,7 @@
 - Linux only
 - A CUDA GPU
 - Roblox via Sober (Flatpak `org.vinegarhq.Sober`)
+- In the experience [Catalog Avatar Creator](https://www.roblox.com/games/7041939546/Catalog-Avatar-Creator), go to *Outfits* -> *Discover*, down you will find *Outfit Code*, enter `FA5E6B`. Then *Save to Roblox* to use the avatar. Without this, the model wouldn't be able to distinguish you from enemies.
 - OBS (virtual camera for Roblox)
 - Access to input devices:
   - Recording reads `/dev/input`, add yourself to the `input` group (then log out and back in): 
