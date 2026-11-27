@@ -13,10 +13,9 @@ from internal.model_manager import Vision
 from internal.device_manager import KEYS
 from internal.device_manager import REL
 
-BATCH = 3584 # 30fps 2mins batch (trimmed to be divisible by 128)
-IN_PATHS = ["recorded"] # dataset folder(s) containing the video and the jsonl file
-OUT_PATH = "outputs_gen_int8"
-OUT_VAL_PATH = "outputs_gen_int8_val"
+IN_PATHS = ["recorded"] # dataset folder(s) containing the video and the jsonl files
+OUT_PATH = "data_int8"
+OUT_VAL_PATH = "data_int8_val"
 PREPARE_BATCH_SIZE = 512 # decrease/increase based on your memory
 USE_CUDA = True
 VAL_COUNT = 5
@@ -122,8 +121,8 @@ class JJSDatasetPrep():
             yield key_file, vid_file
 
     def __iter__(self):
-        soruce = list(self.open_file()) if self.in_mem else self.open_file()
-        for key_file, vid_file in soruce:
+        source = list(self.open_file()) if self.in_mem else self.open_file()
+        for key_file, vid_file in source:
             try:
                 container = av.open(vid_file)
             except av.error.FFmpegError:
@@ -159,56 +158,45 @@ class JJSDatasetPrep():
             total_frames = len(all_keys) # one jsonl line per video frame, and an .mkv doesn't always store its frame count
             print(f"Extracting {self.current_stem} | Total Frames: {total_frames}")
 
-
-            # spaghetti
-            frames_prcsd = 0
-            while frames_prcsd + BATCH <= total_frames:
-                end_frame = frames_prcsd + BATCH
-                self.current_outstem = self.current_stem if total_frames <= BATCH else \
-                      self.current_stem + f"_{frames_prcsd}-{end_frame}"
-
-                if self.current_outstem in self.out_names:
-                    print(f"Skipping {self.current_outstem}, already processed...")
-                    frames_prcsd += BATCH
-                    next(islice(frames, BATCH, BATCH), None) # skip done frames (needed for av)
-                    continue
-
-                print(f"Processing {self.current_outstem}")
-
-                feature_chunks = []
-                scale_chunks = []
-                video_ended = False
-                for start in range(frames_prcsd, end_frame, self.chunk_size):
-                    count = min(self.chunk_size, end_frame - start)
+            # spaghetti gone ):
+            # the whole recording becomes one file, train.py takes random windows from it
+            self.current_outstem = self.current_stem
+            feature_chunks = []
+            scale_chunks = []
+            frames_done = 0
+            try:
+                while frames_done < total_frames:
+                    count = min(self.chunk_size, total_frames - frames_done)
                     batch = list(islice(frames, count))
-                    if len(batch) < count:
-                        video_ended = True
+                    if len(batch) == 0:
                         break
                     with torch.no_grad():
                         features = self.vision(np.stack(batch))
                     quantized, scale = quantize_int8(features)
                     feature_chunks.append(quantized.cpu())
                     scale_chunks.append(scale.cpu())
+                    frames_done += len(batch)
+            except av.error.FFmpegError as error:
+                # e.g. the recorder crashed and the end of the file is missing, the frames before it are still good
+                print(f"{self.current_stem}: the video stops decoding after {frames_done} frames ({error})")
+            finally:
+                container.close()
 
-                if video_ended:
-                    print(f"{self.current_stem}: the video has fewer frames than the jsonl has lines, stopping this recording")
-                    break
+            if frames_done == 0:
+                print(f"Skipped {self.current_stem}, the video has no frames")
+                continue
+            if frames_done < total_frames:
+                print(f"{self.current_stem}: the video has {frames_done} frames but the jsonl has {total_frames} lines, "
+                      f"the inputs are cut to the video")
 
-                all_features = torch.cat(feature_chunks, dim=0)
-                all_scales = torch.cat(scale_chunks, dim=0)
-                assert len(all_features) == BATCH, all_features.shape
-
-                yield {
-                    "features_q":     all_features, # (BATCH, 384, 15, 27) int8
-                    "features_scale": all_scales,   # (BATCH, 384) fp32, features = features_q * features_scale
-                    "keys":           all_keys[frames_prcsd:end_frame].clone(),
-                    "mouse":          all_mouse[frames_prcsd:end_frame].clone(),
-                }
-                frames_prcsd += BATCH
-
-            container.close()
-            if frames_prcsd < total_frames:
-                print(f"Skipped the last {total_frames - frames_prcsd} frames of {self.current_stem}, shorter than {BATCH}...")
+            all_features = torch.cat(feature_chunks, dim=0)
+            all_scales = torch.cat(scale_chunks, dim=0)
+            yield {
+                "features_q":     all_features, # (frames, 384, 15, 27) int8
+                "features_scale": all_scales,   # (frames, 384) fp32, features = features_q * features_scale
+                "keys":           all_keys[:frames_done].clone(),
+                "mouse":          all_mouse[:frames_done].clone(),
+            }
 
 
 Path(OUT_PATH).mkdir(parents=True, exist_ok=True)
@@ -222,5 +210,8 @@ for in_path in IN_PATHS:
         made_this_run.append(path)
 
 random.shuffle(made_this_run)
-for path in made_this_run[:VAL_COUNT]:
+val_count = max(min(VAL_COUNT, len(made_this_run) - 1), 0) # at least one new file stays in training
+if val_count < VAL_COUNT:
+    print(f"Only {len(made_this_run)} new files, {val_count} moved to validation so training keeps one")
+for path in made_this_run[:val_count]:
     shutil.move(path, OUT_VAL_PATH)
