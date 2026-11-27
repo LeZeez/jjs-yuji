@@ -8,8 +8,8 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 @dataclass
 class CaptureConfig:
     cam_idx: int = 2
-    width: int = 1280
-    height: int = 720
+    width: int = 432
+    height: int = 240
     fps: int = 30
     sounds: bool = True   # play a sound on countdown, start, stop, done and errors
 
