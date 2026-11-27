@@ -4,9 +4,9 @@
 
 <p align="center">An AI model that plays JJS (Jujutsu Shenanigans) using imitation learning (behavioral cloning).</p>
 
+Demo in the resolution the model sees.
 
 https://github.com/user-attachments/assets/5384607e-0359-4805-9815-eb08b6f61deb
-
 
 > **Disclaimer:** This repository is for educational and research purposes only. Using bots or automation in Roblox may violate the [Roblox Terms of Use](https://en.help.roblox.com/hc/en-us/articles/115004647846) and can get your account banned. Use it at your own risk.
 
